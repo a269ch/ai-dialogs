@@ -105,6 +105,7 @@ pub struct ViewerState {
     pub assistant_jump_lines: Vec<usize>,
     pub rendered_lines: Vec<Line<'static>>,
     pub rendered_width: usize,
+    pub content_height: usize,
 }
 
 impl ViewerState {
@@ -121,6 +122,7 @@ impl ViewerState {
             assistant_jump_lines: Vec::new(),
             rendered_lines: Vec::new(),
             rendered_width: 0,
+            content_height: 1,
         };
         s.rebuild_rendered_lines(width);
         s
@@ -230,12 +232,23 @@ impl ViewerState {
                 let md_lines = render_markdown_tui(&step.content, content_w);
                 lines.extend(md_lines);
                 lines.push(Line::from(""));
-            } else if role == "tool_call" {
-                for tc in &step.tool_calls {
-                    lines.push(Line::from(Span::styled(
-                        format!("  [🛠️ Tool Call: {}]{}", tc.name, time_str),
-                        Style::default().fg(Color::Yellow),
-                    )));
+            } else if role == "tool_call" || role == "system" {
+                lines.push(Line::from(format!(
+                    "── {}{}",
+                    if role == "system" { "SYSTEM" } else { "TOOL" },
+                    time_str
+                )));
+                lines.extend(render_markdown_tui(&step.content, content_w));
+                lines.push(Line::from(""));
+            }
+            for tc in &step.tool_calls {
+                lines.push(Line::from(Span::styled(
+                    format!("  [🛠️ Tool Call: {}]{}", tc.name, time_str),
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.extend(render_markdown_tui(&tc.args, content_w));
+                if let Some(result) = &tc.result {
+                    lines.extend(render_markdown_tui(result, content_w));
                 }
                 lines.push(Line::from(""));
             }
@@ -245,7 +258,17 @@ impl ViewerState {
     }
 
     pub fn max_scroll_y(&self, content_height: usize) -> usize {
-        self.rendered_lines.len().saturating_sub(content_height)
+        self.rendered_lines
+            .len()
+            .saturating_sub(content_height.max(1))
+    }
+
+    pub fn set_viewport(&mut self, width: usize, height: usize) {
+        if self.rendered_width != width.max(30) {
+            self.rebuild_rendered_lines(width);
+        }
+        self.content_height = height;
+        self.scroll_y = self.scroll_y.min(self.max_scroll_y(height));
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -254,7 +277,7 @@ impl ViewerState {
 
     pub fn scroll_down(&mut self, n: usize, content_height: usize) {
         let max_y = self.max_scroll_y(content_height);
-        self.scroll_y = (self.scroll_y + n).min(max_y);
+        self.scroll_y = self.scroll_y.saturating_add(n).min(max_y);
     }
 
     pub fn scroll_left(&mut self, n: usize) {
@@ -262,7 +285,7 @@ impl ViewerState {
     }
 
     pub fn scroll_right(&mut self, n: usize) {
-        self.scroll_x += n;
+        self.scroll_x = self.scroll_x.saturating_add(n);
     }
 
     pub fn jump_next_user(&mut self, content_height: usize) {
@@ -292,15 +315,14 @@ impl ViewerState {
     }
 
     pub fn find_next(&mut self, content_height: usize) {
-        if self.search_kw.is_empty() {
+        if self.search_kw.is_empty() || self.rendered_lines.is_empty() {
             return;
         }
-        let q = self.search_kw.to_lowercase();
         let max_y = self.max_scroll_y(content_height);
 
         for idx in (self.scroll_y + 1)..self.rendered_lines.len() {
             let full_text = line_to_string(&self.rendered_lines[idx]);
-            if full_text.to_lowercase().contains(&q) {
+            if !case_insensitive_match_ranges(&full_text, &self.search_kw).is_empty() {
                 self.scroll_y = idx.min(max_y);
                 return;
             }
@@ -310,7 +332,7 @@ impl ViewerState {
             .min(self.rendered_lines.len().saturating_sub(1))
         {
             let full_text = line_to_string(&self.rendered_lines[idx]);
-            if full_text.to_lowercase().contains(&q) {
+            if !case_insensitive_match_ranges(&full_text, &self.search_kw).is_empty() {
                 self.scroll_y = idx.min(max_y);
                 return;
             }
@@ -318,16 +340,15 @@ impl ViewerState {
     }
 
     pub fn find_prev(&mut self, content_height: usize) {
-        if self.search_kw.is_empty() {
+        if self.search_kw.is_empty() || self.rendered_lines.is_empty() {
             return;
         }
-        let q = self.search_kw.to_lowercase();
         let max_y = self.max_scroll_y(content_height);
 
         if self.scroll_y > 0 {
             for idx in (0..self.scroll_y).rev() {
                 let full_text = line_to_string(&self.rendered_lines[idx]);
-                if full_text.to_lowercase().contains(&q) {
+                if !case_insensitive_match_ranges(&full_text, &self.search_kw).is_empty() {
                     self.scroll_y = idx.min(max_y);
                     return;
                 }
@@ -335,7 +356,7 @@ impl ViewerState {
         }
         for idx in (self.scroll_y..self.rendered_lines.len()).rev() {
             let full_text = line_to_string(&self.rendered_lines[idx]);
-            if full_text.to_lowercase().contains(&q) {
+            if !case_insensitive_match_ranges(&full_text, &self.search_kw).is_empty() {
                 self.scroll_y = idx.min(max_y);
                 return;
             }
@@ -395,6 +416,15 @@ impl App {
     }
 
     pub fn refresh_all(&mut self) {
+        let marked: Vec<_> = self
+            .store
+            .items
+            .iter()
+            .chain(&self.store.trash_items)
+            .chain(&self.external_items)
+            .filter(|it| it.is_marked)
+            .cloned()
+            .collect();
         self.store.refresh();
         let mut ext = Vec::new();
         for kind in [
@@ -411,6 +441,15 @@ impl App {
             }
         }
         self.external_items = ext;
+        for item in self
+            .store
+            .items
+            .iter_mut()
+            .chain(&mut self.store.trash_items)
+            .chain(&mut self.external_items)
+        {
+            item.is_marked = marked.iter().any(|previous| same_item(item, previous));
+        }
     }
 
     pub fn cycle_provider(&mut self) {
@@ -472,6 +511,10 @@ impl App {
             }
             list
         };
+
+        if let Some(kind) = self.provider_filter {
+            items.retain(|it| it.agent == kind);
+        }
 
         if !self.search_query.is_empty() {
             let q = self.search_query.to_lowercase();
@@ -541,7 +584,7 @@ impl App {
         if items.is_empty() || self.selected_idx >= items.len() {
             return;
         }
-        let target_id = items[self.selected_idx].id.clone();
+        let target = &items[self.selected_idx];
         let is_trash = self.is_trash_view();
         let mut marked_state = None;
 
@@ -549,17 +592,22 @@ impl App {
             .store
             .items_mut(is_trash)
             .iter_mut()
-            .find(|x| x.id == target_id)
+            .find(|x| same_item(x, target))
         {
             it.is_marked = !it.is_marked;
             marked_state = Some(it.is_marked);
-        } else if let Some(it) = self.external_items.iter_mut().find(|x| x.id == target_id) {
+        } else if !is_trash
+            && let Some(it) = self
+                .external_items
+                .iter_mut()
+                .find(|x| same_item(x, target))
+        {
             it.is_marked = !it.is_marked;
             marked_state = Some(it.is_marked);
         }
 
         if let Some(marked) = marked_state {
-            let short_id: String = target_id.chars().take(8).collect();
+            let short_id: String = target.id.chars().take(8).collect();
             self.status_msg = format!(
                 "Dialogue {} {}.",
                 short_id,
@@ -567,8 +615,11 @@ impl App {
             );
         }
 
-        if self.selected_idx + 1 < items.len() {
+        let new_len = self.filtered_items().len();
+        if self.filter_mode != FilterMode::Marked && self.selected_idx + 1 < new_len {
             self.selected_idx += 1;
+        } else {
+            self.selected_idx = self.selected_idx.min(new_len.saturating_sub(1));
         }
     }
 
@@ -582,16 +633,17 @@ impl App {
         let is_trash = self.is_trash_view();
 
         for item in &items {
-            let id = &item.id;
             if let Some(it) = self
                 .store
                 .items_mut(is_trash)
                 .iter_mut()
-                .find(|x| &x.id == id)
+                .find(|x| same_item(x, item))
             {
                 it.is_marked = new_state;
             }
-            if let Some(it) = self.external_items.iter_mut().find(|x| &x.id == id) {
+            if !is_trash
+                && let Some(it) = self.external_items.iter_mut().find(|x| same_item(x, item))
+            {
                 it.is_marked = new_state;
             }
         }
@@ -601,9 +653,16 @@ impl App {
         } else {
             "Unmarked all items.".to_string()
         };
+        self.selected_idx = self
+            .selected_idx
+            .min(self.filtered_items().len().saturating_sub(1));
     }
 
     pub fn prompt_transfer(&mut self) {
+        if self.is_trash_view() {
+            self.status_msg = "Restore the dialogue before transferring it.".to_string();
+            return;
+        }
         let items = self.filtered_items();
         if items.is_empty() || self.selected_idx >= items.len() {
             self.status_msg = "No dialogue selected to transfer.".to_string();
@@ -664,13 +723,7 @@ impl App {
     pub fn prompt_delete_selected(&mut self) {
         let items = self.filtered_items();
         let is_trash = self.is_trash_view();
-        let marked: Vec<DialogueItem> = self
-            .store
-            .items(is_trash)
-            .iter()
-            .filter(|it| it.is_marked)
-            .cloned()
-            .collect();
+        let marked = self.marked_items();
 
         if !marked.is_empty() {
             if is_trash {
@@ -713,13 +766,7 @@ impl App {
 
     pub fn prompt_batch_delete(&mut self) {
         let is_trash = self.is_trash_view();
-        let marked: Vec<DialogueItem> = self
-            .store
-            .items(is_trash)
-            .iter()
-            .filter(|it| it.is_marked)
-            .cloned()
-            .collect();
+        let marked = self.marked_items();
 
         if marked.is_empty() {
             self.status_msg = if is_trash {
@@ -745,6 +792,17 @@ impl App {
         }
     }
 
+    fn marked_items(&self) -> Vec<DialogueItem> {
+        let is_trash = self.is_trash_view();
+        self.store
+            .items(is_trash)
+            .iter()
+            .chain(self.external_items.iter().filter(|_| !is_trash))
+            .filter(|it| it.is_marked)
+            .cloned()
+            .collect()
+    }
+
     pub fn prompt_clean_or_empty(&mut self) {
         if self.is_trash_view() {
             let count = self.store.trash_items.len();
@@ -759,11 +817,9 @@ impl App {
             }
         } else {
             let empty_items: Vec<DialogueItem> = self
-                .store
-                .items
-                .iter()
+                .filtered_items()
+                .into_iter()
                 .filter(|it| it.is_empty)
-                .cloned()
                 .collect();
             if empty_items.is_empty() {
                 self.status_msg = "No empty sessions detected.".to_string();
@@ -794,6 +850,7 @@ impl App {
         let short_id: String = target.id.chars().take(8).collect();
         match self.store.restore(&target) {
             Ok(()) => {
+                self.refresh_all();
                 self.status_msg = format!("✅ Dialogue {} successfully restored!", short_id);
                 let new_len = self.filtered_items().len();
                 if self.selected_idx >= new_len {
@@ -830,7 +887,7 @@ impl App {
         match dialog.action {
             ConfirmAction::DeleteSingle(item) => {
                 let short_id: String = item.id.chars().take(8).collect();
-                match self.store.delete(&item, true, true) {
+                match self.store.delete(&item, true, false) {
                     Ok(()) => {
                         self.status_msg =
                             format!("Dialogue {} moved to trash (press [T] to view).", short_id);
@@ -840,7 +897,7 @@ impl App {
             }
             ConfirmAction::DeletePermanentSingle(item) => {
                 let short_id: String = item.id.chars().take(8).collect();
-                match self.store.delete_permanently(&item, true) {
+                match self.store.delete_permanently(&item, false) {
                     Ok(()) => {
                         self.status_msg = format!("Dialogue {} permanently deleted.", short_id);
                     }
@@ -850,16 +907,13 @@ impl App {
                 }
             }
             ConfirmAction::DeleteBatch(marked) => {
-                let count = self.store.delete_batch(&marked, true);
-                self.status_msg = format!("Moved {} dialogues to trash.", count);
+                self.delete_batch_with_status(&marked, false);
             }
             ConfirmAction::DeletePermanentBatch(marked) => {
-                let count = self.store.delete_permanently_batch(&marked);
-                self.status_msg = format!("Permanently deleted {} dialogues from trash.", count);
+                self.delete_batch_with_status(&marked, true);
             }
             ConfirmAction::CleanEmpty(empty) => {
-                let count = self.store.delete_batch(&empty, true);
-                self.status_msg = format!("Moved {} empty sessions to trash.", count);
+                self.delete_batch_with_status(&empty, false);
             }
             ConfirmAction::EmptyTrash => match self.store.empty_trash() {
                 Ok(count) => {
@@ -877,16 +931,78 @@ impl App {
             self.selected_idx = new_len.saturating_sub(1);
         }
     }
+
+    fn delete_batch_with_status(&mut self, items: &[DialogueItem], permanent: bool) {
+        let mut count = 0;
+        let mut failures = Vec::new();
+        for item in items {
+            let result = if permanent {
+                self.store.delete_permanently(item, false)
+            } else {
+                self.store.delete(item, true, false)
+            };
+            match result {
+                Ok(()) => count += 1,
+                Err(error) => {
+                    failures.push(format!("{} {}: {}", item.agent.short_tag(), item.id, error))
+                }
+            }
+        }
+        self.status_msg = if permanent {
+            format!("Permanently deleted {} dialogues from trash.", count)
+        } else {
+            format!("Moved {} dialogues to trash.", count)
+        };
+        if let Some(first_error) = failures.first() {
+            self.status_msg
+                .push_str(&format!(" Failed: {}. {}", failures.len(), first_error));
+        }
+    }
 }
 
 pub fn line_to_string(line: &Line) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+fn same_item(left: &DialogueItem, right: &DialogueItem) -> bool {
+    left.agent == right.agent
+        && left.id == right.id
+        && left.is_in_trash == right.is_in_trash
+        && left.trash_folder == right.trash_folder
+}
+
+pub fn case_insensitive_match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query: String = query.chars().flat_map(char::to_lowercase).collect();
+    let mut folded = String::new();
+    let mut source_ranges = Vec::new();
+    for (start, ch) in text.char_indices() {
+        let end = start + ch.len_utf8();
+        for folded_ch in ch.to_lowercase() {
+            folded.push(folded_ch);
+            source_ranges.extend(std::iter::repeat_n(start..end, folded_ch.len_utf8()));
+        }
+    }
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for (start, matched) in folded.match_indices(&query) {
+        let range = source_ranges[start].start..source_ranges[start + matched.len() - 1].end;
+        if let Some(previous) = ranges.last_mut()
+            && range.start < previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            ranges.push(range);
+        }
+    }
+    ranges
+}
+
 pub fn slice_spans(spans: &[Span], scroll_x: usize, max_cols: usize) -> Vec<Span<'static>> {
     let mut result = Vec::new();
     let mut current_col = 0;
-    let end_col = scroll_x + max_cols;
+    let end_col = scroll_x.saturating_add(max_cols);
 
     for span in spans {
         let span_str = span.content.as_ref();
@@ -920,8 +1036,248 @@ pub fn slice_spans(spans: &[Span], scroll_x: usize, max_cols: usize) -> Vec<Span
 }
 
 #[cfg(test)]
+pub(super) fn test_app(base: &std::path::Path) -> App {
+    App {
+        store: DialogueStore {
+            base_dir: base.to_path_buf(),
+            brain_dir: base.join("brain"),
+            conv_dir: base.join("conversations"),
+            annot_dir: base.join("annotations"),
+            presence_dir: base.join("presence"),
+            summaries_db: base.join("conversation_summaries.db"),
+            trash_dir: base.join("trash"),
+            items: Vec::new(),
+            trash_items: Vec::new(),
+        },
+        registry: ProviderRegistry::empty(),
+        provider_filter: None,
+        external_items: Vec::new(),
+        transfer_dialog: None,
+        selected_idx: 0,
+        filter_mode: FilterMode::All,
+        sort_mode: SortMode::Newest,
+        search_query: String::new(),
+        is_searching: false,
+        search_input: String::new(),
+        status_msg: String::new(),
+        running: true,
+        show_help: false,
+        confirm: None,
+        viewer: None,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_displays_tool_only_assistant_turns_and_system_context() {
+        let item = DialogueItem::new_external(
+            "id".into(),
+            AgentKind::Claude,
+            "tools".into(),
+            None,
+            0,
+            1,
+            0,
+            None,
+        );
+        let steps = vec![
+            DialogueStep {
+                role: "assistant".into(),
+                time: String::new(),
+                timestamp: None,
+                content: String::new(),
+                tool_calls: vec![crate::models::ToolCall {
+                    name: "read_file".into(),
+                    args: "main.rs".into(),
+                    result: Some("file contents".into()),
+                }],
+            },
+            DialogueStep {
+                role: "system".into(),
+                time: String::new(),
+                timestamp: None,
+                content: "System context".into(),
+                tool_calls: vec![],
+            },
+        ];
+        let viewer = ViewerState::new(item, steps, 80);
+        let text = viewer
+            .rendered_lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in ["read_file", "main.rs", "file contents", "System context"] {
+            assert!(text.contains(needle), "missing {needle}");
+        }
+    }
+    use crate::canonical::CanonicalDialogue;
+    use crate::providers::universal::UniversalProvider;
+    use crate::test_support::TestDir;
+    use std::fs;
+
+    fn item(agent: AgentKind) -> DialogueItem {
+        DialogueItem::new_external(
+            "shared-id".into(),
+            agent,
+            "test".into(),
+            None,
+            1,
+            1,
+            0,
+            None,
+        )
+    }
+
+    #[test]
+    fn marks_use_provider_and_id_for_single_and_select_all() {
+        let mut app = test_app(std::path::Path::new("unused-test-path"));
+        app.store.items.push(item(AgentKind::Antigravity));
+        app.external_items = vec![item(AgentKind::Claude), item(AgentKind::Universal)];
+        app.provider_filter = Some(AgentKind::Universal);
+
+        app.toggle_mark_selected();
+        assert!(!app.store.items[0].is_marked);
+        assert!(!app.external_items[0].is_marked);
+        assert!(app.external_items[1].is_marked);
+
+        app.toggle_mark_all();
+        assert!(!app.external_items[1].is_marked);
+        app.toggle_mark_all();
+        assert!(!app.store.items[0].is_marked);
+        assert!(!app.external_items[0].is_marked);
+        assert!(app.external_items[1].is_marked);
+    }
+
+    #[test]
+    fn marked_batches_include_external_providers() {
+        let mut app = test_app(std::path::Path::new("unused-test-path"));
+        app.store.items.push(item(AgentKind::Antigravity));
+        app.external_items = vec![item(AgentKind::Claude), item(AgentKind::Universal)];
+        app.toggle_mark_all();
+        app.prompt_batch_delete();
+        let ConfirmAction::DeleteBatch(items) = app.confirm.take().unwrap().action else {
+            panic!("expected batch deletion");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().any(|it| it.agent == AgentKind::Universal));
+
+        app.store.items[0].is_marked = false;
+        app.prompt_delete_selected();
+        let ConfirmAction::DeleteBatch(items) = app.confirm.take().unwrap().action else {
+            panic!("expected marked external batch deletion");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|it| it.agent != AgentKind::Antigravity));
+    }
+
+    #[test]
+    fn external_delete_and_restore_preserve_same_id_antigravity_source() {
+        for marked in [false, true] {
+            let dir = TestDir::new("tui-delete");
+            let mut app = test_app(&dir.path().join("antigravity"));
+            fs::create_dir_all(app.store.brain_dir.join("shared-id")).unwrap();
+            fs::create_dir_all(&app.store.conv_dir).unwrap();
+            let source_database = app.store.conv_dir.join("shared-id.db");
+            fs::write(&source_database, "precious source database").unwrap();
+            let sessions = dir.path().join("universal");
+            fs::create_dir(&sessions).unwrap();
+            let transcript = sessions.join("shared-id.json");
+            let dialogue = CanonicalDialogue::new("shared-id", "test", AgentKind::Universal);
+            let bytes = serde_json::to_vec(&dialogue).unwrap();
+            fs::write(&transcript, &bytes).unwrap();
+            app.registry
+                .register(Box::new(UniversalProvider::with_base_dir(sessions)));
+            app.refresh_all();
+            app.provider_filter = Some(AgentKind::Universal);
+            assert_eq!(app.filtered_items().len(), 1);
+
+            if marked {
+                app.toggle_mark_selected();
+                app.prompt_batch_delete();
+            } else {
+                app.prompt_delete_selected();
+            }
+            app.execute_confirm();
+            assert!(app.status_msg.contains("trash"), "{}", app.status_msg);
+            assert!(!transcript.exists());
+            assert_eq!(
+                fs::read_to_string(&source_database).unwrap(),
+                "precious source database"
+            );
+            assert!(app.store.brain_dir.join("shared-id").is_dir());
+            assert!(app.external_items.is_empty());
+
+            app.filter_mode = FilterMode::Trash;
+            let trash = app.filtered_items();
+            assert_eq!(trash.len(), 1);
+            assert_eq!(trash[0].agent, AgentKind::Universal);
+            app.restore_selected();
+            assert!(
+                app.status_msg.contains("successfully restored"),
+                "{}",
+                app.status_msg
+            );
+            assert_eq!(fs::read(&transcript).unwrap(), bytes);
+            assert!(app.store.trash_items.is_empty());
+            assert_eq!(app.external_items.len(), 1);
+        }
+    }
+
+    #[test]
+    fn batch_delete_reports_failures() {
+        let dir = TestDir::new("tui-delete-failure");
+        let mut app = test_app(dir.path());
+        let mut missing = item(AgentKind::Universal);
+        missing.transcript_path = Some(dir.path().join("missing.json"));
+        app.delete_batch_with_status(&[missing], false);
+        assert!(app.status_msg.contains("Moved 0 dialogues"));
+        assert!(app.status_msg.contains("Failed: 1"));
+        assert!(app.status_msg.contains("UNIV shared-id"));
+    }
+
+    #[test]
+    fn trash_transfer_requires_restoring_the_selected_backup() {
+        let mut app = test_app(std::path::Path::new("unused-test-path"));
+        app.filter_mode = FilterMode::Trash;
+        app.store.trash_items.push(item(AgentKind::Universal));
+        app.prompt_transfer();
+        assert!(app.transfer_dialog.is_none());
+        assert!(app.status_msg.contains("Restore"));
+    }
+
+    #[test]
+    fn trash_filter_and_marks_distinguish_repeated_backups() {
+        let mut app = test_app(std::path::Path::new("unused-test-path"));
+        let mut first = item(AgentKind::Universal);
+        first.is_in_trash = true;
+        first.trash_folder = Some("first-backup".into());
+        let mut second = first.clone();
+        second.trash_folder = Some("second-backup".into());
+        app.store.trash_items = vec![item(AgentKind::Claude), first, second];
+        app.filter_mode = FilterMode::Trash;
+        app.provider_filter = Some(AgentKind::Universal);
+        assert_eq!(app.filtered_items().len(), 2);
+        app.selected_idx = 1;
+        app.toggle_mark_selected();
+        assert!(!app.store.trash_items[1].is_marked);
+        assert!(app.store.trash_items[2].is_marked);
+    }
+
+    #[test]
+    fn unmarking_in_marked_view_keeps_selection_valid() {
+        let mut app = test_app(std::path::Path::new("unused-test-path"));
+        let mut marked = item(AgentKind::Universal);
+        marked.is_marked = true;
+        app.external_items.push(marked);
+        app.filter_mode = FilterMode::Marked;
+        app.toggle_mark_selected();
+        assert!(app.filtered_items().is_empty());
+        assert_eq!(app.selected_idx, 0);
+    }
 
     #[test]
     fn test_filter_mode_cycle() {
@@ -945,7 +1301,7 @@ mod tests {
 
     #[test]
     fn test_cycle_provider() {
-        let mut app = App::new();
+        let mut app = test_app(std::path::Path::new("unused-test-path"));
         assert_eq!(app.provider_name(), "ALL");
         app.cycle_provider();
         assert_eq!(app.provider_name(), "AGY");

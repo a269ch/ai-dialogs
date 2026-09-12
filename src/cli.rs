@@ -4,9 +4,10 @@ use std::process;
 
 use crate::canonical::AgentKind;
 use crate::cleaner::format_bytes;
+use crate::error::{AppError, Result};
 use crate::markdown::ansi::render_ansi;
 use crate::models::{ActiveItemJson, DialogueItem, DialogueStoreJson, TrashItemJson};
-use crate::providers::ProviderRegistry;
+use crate::providers::{ProviderRegistry, resolve_dialogue};
 use crate::storage::DialogueStore;
 use crate::transfer::TransferEngine;
 
@@ -161,6 +162,7 @@ fn prompt_user(prompt: &str) -> bool {
 
 pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
     let registry = ProviderRegistry::new();
+    let provider_filter = cli_result(parse_provider_filter(cli.provider.as_deref()));
 
     if cli.providers {
         println!();
@@ -198,7 +200,11 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
     }
 
     if let Some(ref tid) = cli.transfer {
-        let from_str = cli.from_agent.as_deref().unwrap_or("agy");
+        let from_str = cli
+            .from_agent
+            .as_deref()
+            .or(provider_filter.map(|kind| kind.as_str()))
+            .unwrap_or("agy");
         let to_str = match cli.to_agent.as_deref() {
             Some(t) => t,
             None => {
@@ -282,13 +288,11 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
     }
 
     if let Some(ref path_str) = cli.export_json {
-        let from_str = cli.from_agent.as_deref().unwrap_or("agy");
-        let from_kind = match AgentKind::parse_str(from_str) {
-            Some(k) => k,
-            None => {
-                eprintln!("Invalid source agent '{}'.", from_str);
-                process::exit(1);
-            }
+        let source_filter = match cli.from_agent.as_deref() {
+            Some(from) => Some(cli_result(AgentKind::parse_str(from).ok_or_else(|| {
+                AppError::General(format!("Invalid source agent '{}'.", from))
+            }))),
+            None => provider_filter,
         };
         let export_id = match cli.view.as_deref().or(cli.export.as_deref()) {
             Some(id) => id,
@@ -297,10 +301,16 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
                 process::exit(1);
             }
         };
+        let item = cli_result(registry.find_dialogue_in(export_id, source_filter))
+            .map(|(_, item)| item)
+            .unwrap_or_else(|| {
+                eprintln!("Dialogue '{}' not found.", export_id);
+                process::exit(1)
+            });
         match TransferEngine::export_file(
             &registry,
-            from_kind,
-            export_id,
+            item.agent,
+            &item.id,
             std::path::Path::new(path_str),
         ) {
             Ok(()) => {
@@ -318,8 +328,8 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
     }
 
     if cli.json {
-        let active_items: Vec<ActiveItemJson> = store
-            .items
+        let inventory = cli_result(registry.list_dialogues(provider_filter));
+        let active_items: Vec<ActiveItemJson> = inventory
             .iter()
             .map(|it| ActiveItemJson {
                 id: &it.id,
@@ -337,6 +347,7 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
         let trash_items: Vec<TrashItemJson> = store
             .trash_items
             .iter()
+            .filter(|item| provider_filter.is_none_or(|kind| item.agent == kind))
             .map(|it| TrashItemJson {
                 id: &it.id,
                 agent: it.agent.as_str(),
@@ -364,47 +375,40 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
     }
 
     if cli.trash {
-        cli_list_trash(store);
+        let items: Vec<_> = store
+            .trash_items
+            .iter()
+            .filter(|item| provider_filter.is_none_or(|kind| item.agent == kind))
+            .cloned()
+            .collect();
+        cli_list_trash_items(&items);
         return;
     }
 
     if cli.list {
-        if let Some(ref prov_str) = cli.provider {
-            if prov_str == "all" {
-                let items = registry.list_all_dialogues();
-                cli_list_external(&items, "All Providers");
-                return;
-            } else if let Some(kind) = AgentKind::parse_str(prov_str)
-                && kind != AgentKind::Antigravity
-                && let Some(p) = registry.get(kind)
-            {
-                match p.list_dialogues() {
-                    Ok(items) => {
-                        cli_list_external(&items, p.display_name());
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("Error listing {} dialogues: {}", p.display_name(), e);
-                        process::exit(1);
-                    }
-                }
-            }
-        }
-        cli_list(store, true, true);
+        let items = cli_result(registry.list_dialogues(provider_filter));
+        cli_list_external(
+            &items,
+            provider_filter
+                .map(|kind| kind.display_name())
+                .unwrap_or("All Providers"),
+        );
         return;
     }
 
     if let Some(ref view_id) = cli.view {
-        if let Some((_prov, item)) = registry.find_dialogue(view_id) {
-            cli_view_item(store, &item, false);
-            return;
-        }
-        cli_view(store, view_id);
+        let item = cli_result(resolve_cli_item(&registry, store, view_id, provider_filter));
+        cli_view_item(store, &item, item.is_in_trash);
         return;
     }
 
     if let Some(ref restore_id) = cli.restore {
-        let item = store.find(restore_id, true).cloned();
+        let item = cli_result(resolve_dialogue(
+            &store.trash_items,
+            restore_id,
+            provider_filter,
+        ))
+        .cloned();
         match item {
             Some(it) => match store.restore(&it) {
                 Ok(()) => {
@@ -427,56 +431,54 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
     }
 
     if cli.empty_trash {
-        if store.trash_items.is_empty() {
+        let items: Vec<_> = store
+            .trash_items
+            .iter()
+            .filter(|item| provider_filter.is_none_or(|kind| item.agent == kind))
+            .cloned()
+            .collect();
+        if items.is_empty() {
             println!("Trash is already empty.");
             return;
         }
         if !cli.force {
             let msg = format!(
                 "Are you sure you want to PERMANENTLY delete {} dialogues from trash? [y/N]: ",
-                store.trash_items.len()
+                items.len()
             );
             if !prompt_user(&msg) {
                 println!("Trash cleanup cancelled.");
                 return;
             }
         }
-        match store.empty_trash() {
-            Ok(cleared) => println!("Trash emptied ({} entries removed).", cleared),
-            Err(e) => eprintln!("Error emptying trash: {}", e),
+        for item in &items {
+            cli_result(store.delete_permanently(item, false));
         }
+        store.refresh();
+        println!("Trash emptied ({} entries removed).", items.len());
         return;
     }
 
     if let Some(ref export_id) = cli.export {
-        let item = store
-            .find(export_id, false)
-            .or_else(|| store.find(export_id, true))
-            .cloned();
-
-        match item {
-            Some(it) => match store.export_to_markdown(&it, None) {
-                Ok(path) => println!("Dialogue exported to: {}", path.display()),
-                Err(e) => eprintln!("Export error: {}", e),
-            },
-            None => {
-                if let Some((_prov, it)) = registry.find_dialogue(export_id) {
-                    match store.export_to_markdown(&it, None) {
-                        Ok(path) => println!("Dialogue exported to: {}", path.display()),
-                        Err(e) => eprintln!("Export error: {}", e),
-                    }
-                    return;
-                }
-                eprintln!("Dialogue '{}' not found.", export_id);
-                process::exit(1);
-            }
-        }
+        let item = cli_result(resolve_cli_item(
+            &registry,
+            store,
+            export_id,
+            provider_filter,
+        ));
+        let path = cli_result(store.export_to_markdown(&item, None));
+        println!("Dialogue exported to: {}", path.display());
         return;
     }
 
     if let Some(ref delete_id) = cli.delete {
-        let active_item = store.find(delete_id, false).cloned();
-        if let Some(it) = active_item {
+        let it = cli_result(resolve_cli_item(
+            &registry,
+            store,
+            delete_id,
+            provider_filter,
+        ));
+        if !it.is_in_trash {
             if !cli.force {
                 let topic_trunc: String = it.topic.chars().take(40).collect();
                 let msg = format!(
@@ -490,10 +492,11 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
             }
             match store.delete(&it, true, true) {
                 Ok(()) => {
-                    let short_id: String = it.id.chars().take(8).collect();
                     println!(
-                        "Dialogue {} moved to trash. (Restore: ai-dialogs --restore {})",
-                        it.id, short_id
+                        "Dialogue {} moved to trash. (Restore: ai-dialogs --restore {} --provider {})",
+                        it.id,
+                        it.id,
+                        it.agent.as_str()
                     );
                 }
                 Err(e) => {
@@ -504,8 +507,7 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
             return;
         }
 
-        let trash_item = store.find(delete_id, true).cloned();
-        if let Some(it) = trash_item {
+        if it.is_in_trash {
             if !cli.force {
                 let topic_trunc: String = it.topic.chars().take(40).collect();
                 let msg = format!(
@@ -534,7 +536,11 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
     }
 
     if cli.clean_empty {
-        let empty_count = store.items.iter().filter(|i| i.is_empty).count();
+        let empty_items: Vec<_> = cli_result(registry.list_dialogues(provider_filter))
+            .into_iter()
+            .filter(|item| item.is_empty)
+            .collect();
+        let empty_count = empty_items.len();
         if empty_count == 0 {
             println!("No empty sessions found.");
             return;
@@ -546,9 +552,46 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
                 return;
             }
         }
-        let count = store.clean_empty(true);
-        println!("{} empty sessions moved to trash.", count);
+        for item in &empty_items {
+            cli_result(store.delete(item, true, false));
+        }
+        store.refresh();
+        println!("{} empty sessions moved to trash.", empty_count);
     }
+}
+
+fn parse_provider_filter(value: Option<&str>) -> Result<Option<AgentKind>> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.trim().eq_ignore_ascii_case("all") => Ok(None),
+        Some(value) => AgentKind::parse_str(value).map(Some).ok_or_else(|| {
+            AppError::General(format!(
+                "Invalid provider '{}'. Available: agy, claude, codex, grok, universal, all",
+                value
+            ))
+        }),
+    }
+}
+
+fn cli_result<T>(result: Result<T>) -> T {
+    result.unwrap_or_else(|error| {
+        eprintln!("Error: {}", error);
+        process::exit(1)
+    })
+}
+
+fn resolve_cli_item(
+    registry: &ProviderRegistry,
+    store: &DialogueStore,
+    id: &str,
+    filter: Option<AgentKind>,
+) -> Result<DialogueItem> {
+    if let Some((_, item)) = registry.find_dialogue_in(id, filter)? {
+        return Ok(item);
+    }
+    resolve_dialogue(&store.trash_items, id, filter)?
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(id.to_string()))
 }
 
 pub fn cli_list(store: &DialogueStore, _header: bool, _footer: bool) {
@@ -609,16 +652,20 @@ pub fn cli_list_external(items: &[DialogueItem], provider_name: &str) {
 }
 
 pub fn cli_list_trash(store: &DialogueStore) {
+    cli_list_trash_items(&store.trash_items);
+}
+
+fn cli_list_trash_items(items: &[DialogueItem]) {
     println!(
         "\n{:<3} {:<10} {:<17} {:<10} {:<10} TOPIC IN TRASH",
         "#", "ID", "DELETED", "MSGS", "SIZE"
     );
     println!("{}", "─".repeat(100));
 
-    if store.trash_items.is_empty() {
+    if items.is_empty() {
         println!("  Trash is empty.");
     } else {
-        for (i, item) in store.trash_items.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
             let msgs = format!("{}u / {}m", item.user_msgs_count, item.model_msgs_count);
             let size = format_bytes(item.size_bytes);
             let del_d = item.deleted_date_str();
@@ -636,7 +683,7 @@ pub fn cli_list_trash(store: &DialogueStore) {
         }
     }
     println!("{}", "─".repeat(100));
-    println!("Total in trash: {}", store.trash_items.len());
+    println!("Total in trash: {}", items.len());
     println!("To restore use:   ai-dialogs --restore <ID>");
     println!("To empty trash:   ai-dialogs --empty-trash\n");
 }
@@ -723,9 +770,21 @@ pub fn cli_view_item(store: &DialogueStore, item: &DialogueItem, in_trash: bool)
             println!("\x1b[1;38;5;177m{}\x1b[0m", banner);
             println!("{}", render_ansi(&step.content, render_w));
             println!();
-        } else if role == "tool_call" {
-            for tc in &step.tool_calls {
-                println!("\x1b[0;33m  [🛠️ Tool Call: {}]{}\x1b[0m", tc.name, time_str);
+        } else if role == "system" {
+            println!("── SYSTEM{}", time_str);
+            println!("{}", render_ansi(&step.content, render_w));
+            println!();
+        } else if role == "tool_call" && !step.content.is_empty() {
+            println!("{}", render_ansi(&step.content, render_w));
+            println!();
+        }
+        for tc in &step.tool_calls {
+            println!("\x1b[0;33m  [🛠️ Tool Call: {}]{}\x1b[0m", tc.name, time_str);
+            if !tc.args.is_empty() {
+                println!("{}", tc.args);
+            }
+            if let Some(result) = &tc.result {
+                println!("{}", render_ansi(result, render_w));
             }
             println!();
         }

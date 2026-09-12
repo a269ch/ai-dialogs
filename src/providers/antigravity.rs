@@ -27,6 +27,10 @@ impl AntigravityProvider {
             .unwrap_or_else(|| PathBuf::from("."));
         Self { base_dir }
     }
+
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
 }
 
 impl DialogueProvider for AntigravityProvider {
@@ -43,28 +47,33 @@ impl DialogueProvider for AntigravityProvider {
     }
 
     fn list_dialogues(&self) -> Result<Vec<DialogueItem>> {
-        let store = DialogueStore::new();
+        let store = DialogueStore::with_base_dir(self.base_dir.clone());
         Ok(store.items)
     }
 
     fn load_canonical(&self, id: &str) -> Result<CanonicalDialogue> {
-        let store = DialogueStore::new();
-        let item = store
-            .items
-            .iter()
-            .chain(store.trash_items.iter())
-            .find(|it| it.id == id || it.id.starts_with(id))
-            .ok_or_else(|| AppError::General(format!("Antigravity dialogue not found: {}", id)))?;
+        let store = DialogueStore::with_base_dir(self.base_dir.clone());
+        let item =
+            crate::providers::resolve_dialogue(&store.items, id, Some(AgentKind::Antigravity))?
+                .ok_or_else(|| {
+                    AppError::General(format!("Antigravity dialogue not found: {}", id))
+                })?;
 
         let steps = store.load_conversation_steps(item);
         let mut canonical = CanonicalDialogue::new(&item.id, &item.topic, AgentKind::Antigravity);
         canonical.created_at = item.created_at.clone();
+        canonical.updated_at = steps
+            .iter()
+            .rev()
+            .find_map(|step| step.timestamp.clone())
+            .or_else(|| canonical.created_at.clone());
 
         for (idx, step) in steps.into_iter().enumerate() {
             let role = match step.role.as_str() {
                 "user" => CanonicalRole::User,
                 "assistant" => CanonicalRole::Assistant,
                 "tool_call" => CanonicalRole::ToolCall,
+                "system" => CanonicalRole::System,
                 _ => CanonicalRole::User,
             };
 
@@ -74,7 +83,7 @@ impl DialogueProvider for AntigravityProvider {
                 .map(|tc| CanonicalToolCall {
                     name: tc.name,
                     args: tc.args,
-                    result: None,
+                    result: tc.result,
                 })
                 .collect();
 
@@ -82,7 +91,7 @@ impl DialogueProvider for AntigravityProvider {
                 id: format!("{}-{}", item.id, idx + 1),
                 role,
                 content: step.content,
-                timestamp: Some(step.time),
+                timestamp: step.timestamp,
                 tool_calls,
                 model: None,
             };
@@ -103,7 +112,7 @@ impl DialogueProvider for AntigravityProvider {
         fs::create_dir_all(&brain_log_dir)?;
 
         let transcript_path = brain_log_dir.join("transcript.jsonl");
-        let mut file = File::create(&transcript_path)?;
+        let mut file = File::create_new(&transcript_path)?;
 
         for (idx, msg) in dialogue.messages.iter().enumerate() {
             let (source, step_type) = match msg.role {
@@ -118,8 +127,11 @@ impl DialogueProvider for AntigravityProvider {
                 .iter()
                 .map(|tc| {
                     json!({
-                        "name": tc.name,
-                        "args": tc.args,
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.args,
+                        },
+                        "result": tc.result,
                     })
                 })
                 .collect();
@@ -137,5 +149,54 @@ impl DialogueProvider for AntigravityProvider {
         }
 
         Ok(new_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_records_and_full_timestamps_survive_save_load_and_markdown_export() {
+        let fixture = crate::test_support::TestDir::new("antigravity-tools");
+        let provider = AntigravityProvider::with_base_dir(fixture.path().join("agy"));
+        let mut dialogue = CanonicalDialogue::new("source", "tools", AgentKind::Universal);
+        for (role, content) in [
+            (CanonicalRole::User, "Prompt"),
+            (CanonicalRole::Assistant, "Using the tool"),
+            (CanonicalRole::ToolCall, "Tool context"),
+            (CanonicalRole::Assistant, ""),
+            (CanonicalRole::System, "System context"),
+        ] {
+            let mut message = CanonicalMessage::new(role, content);
+            message.timestamp = Some("2021-02-03T04:05:06+03:00".into());
+            if matches!(role, CanonicalRole::Assistant | CanonicalRole::ToolCall) {
+                message.tool_calls.push(CanonicalToolCall {
+                    name: "read_file".into(),
+                    args: "{\"path\":\"main.rs\"}".into(),
+                    result: Some("file contents".into()),
+                });
+            }
+            dialogue.messages.push(message);
+        }
+        let id = provider.save_canonical(&dialogue).unwrap();
+        let loaded = provider.load_canonical(&id).unwrap();
+        assert_eq!(loaded.messages.len(), dialogue.messages.len());
+        for (actual, expected) in loaded.messages.iter().zip(&dialogue.messages) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+            assert_eq!(actual.timestamp, expected.timestamp);
+            assert_eq!(
+                serde_json::to_value(&actual.tool_calls).unwrap(),
+                serde_json::to_value(&expected.tool_calls).unwrap()
+            );
+        }
+        let item = provider.list_dialogues().unwrap().pop().unwrap();
+        let store = DialogueStore::with_base_dir(fixture.path().join("agy"));
+        let output = fixture.path().join("export.md");
+        store.export_to_markdown(&item, Some(&output)).unwrap();
+        let markdown = fs::read_to_string(output).unwrap();
+        assert_eq!(markdown.matches("Tool Call `read_file`").count(), 3);
+        assert!(markdown.contains("file contents") && markdown.contains("System context"));
     }
 }

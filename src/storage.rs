@@ -1,10 +1,12 @@
+use crate::canonical::AgentKind;
 use crate::cleaner::{clean_user_content, format_bytes, is_system_noise};
 use crate::error::{AppError, Result};
 use crate::models::{DialogueItem, DialogueStep, ToolCall};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,6 +35,10 @@ impl DialogueStore {
     pub fn new() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let base_dir = home.join(".gemini").join("antigravity-cli");
+        Self::with_base_dir(base_dir)
+    }
+
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
         let brain_dir = base_dir.join("brain");
         let conv_dir = base_dir.join("conversations");
         let annot_dir = base_dir.join("annotations");
@@ -119,10 +125,30 @@ impl DialogueStore {
         {
             for entry in entries.flatten() {
                 let folder = entry.path();
+                let manifest_path = folder.join("manifest.json");
+                if manifest_path.is_file() {
+                    if let Ok(file) = File::open(&manifest_path)
+                        && let Ok(manifest) = serde_json::from_reader::<_, TrashManifest>(file)
+                    {
+                        let transcript =
+                            archived_transcript_path(&folder, &manifest.original_transcript);
+                        let mut item = manifest.item;
+                        item.is_in_trash = true;
+                        item.is_marked = false;
+                        item.trash_folder = Some(folder.clone());
+                        item.transcript_path = Some(transcript);
+                        item.size_bytes = get_dir_size(&folder);
+                        self.trash_items.push(item);
+                    }
+                    continue;
+                }
                 if folder.is_dir()
                     && let Some(folder_name) = folder.file_name().and_then(|s| s.to_str())
                 {
-                    let cid = folder_name.split('_').next().unwrap_or("").to_string();
+                    let cid = folder_name
+                        .rsplit_once('_')
+                        .map_or(folder_name, |(id, _)| id)
+                        .to_string();
                     if !cid.is_empty() {
                         let item = self.load_dialogue_item(&cid, true, Some(folder));
                         self.trash_items.push(item);
@@ -264,51 +290,44 @@ impl DialogueStore {
     }
 
     pub fn delete(&mut self, item: &DialogueItem, use_trash: bool, refresh: bool) -> Result<()> {
+        if item.is_in_trash {
+            return Err(AppError::General(
+                "Dialogue is already in trash".to_string(),
+            ));
+        }
+        if item.agent != AgentKind::Antigravity {
+            return self.delete_external(item, use_trash, refresh);
+        }
+        validate_session_id(&item.id)?;
+        let paths = self.active_paths(&item.id);
+        let sources: Vec<PathBuf> = paths.into_iter().filter(|p| path_exists(p)).collect();
+        if sources.is_empty() {
+            return Err(AppError::General("Dialogue files not found".to_string()));
+        }
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| AppError::General(e.to_string()))?
             .as_secs();
 
-        let trash_subfolder = self.trash_dir.join(format!("{}_{}", item.id, timestamp));
-
         if use_trash {
-            fs::create_dir_all(&trash_subfolder)?;
-        }
-
-        if item.brain_path.is_dir() {
-            if use_trash {
-                fs::rename(&item.brain_path, trash_subfolder.join("brain"))?;
-            } else {
-                let _ = fs::remove_dir_all(&item.brain_path);
-            }
-        }
-
-        let prefix = format!("{}.db", item.id);
-        if self.conv_dir.is_dir()
-            && let Ok(entries) = fs::read_dir(&self.conv_dir)
-        {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(fname) = path.file_name().and_then(|s| s.to_str())
-                    && fname.starts_with(&prefix)
-                {
-                    if use_trash {
-                        let _ = fs::rename(&path, trash_subfolder.join(fname));
+            fs::create_dir_all(&self.trash_dir)?;
+            let trash_subfolder = self.trash_dir.join(format!("{}_{}", item.id, timestamp));
+            fs::create_dir(&trash_subfolder)?;
+            let moves: Vec<_> = sources
+                .iter()
+                .map(|source| {
+                    let name = if source == &self.brain_dir.join(&item.id) {
+                        std::ffi::OsStr::new("brain")
                     } else {
-                        let _ = fs::remove_file(&path);
-                    }
-                }
-            }
-        }
-
-        for path in [&item.annot_path, &item.presence_path] {
-            if path.exists() {
-                if use_trash {
-                    let fname = path.file_name().unwrap_or_default();
-                    let _ = fs::rename(path, trash_subfolder.join(fname));
-                } else {
-                    let _ = fs::remove_file(path);
-                }
+                        source.file_name().expect("session path has a filename")
+                    };
+                    (source.clone(), trash_subfolder.join(name))
+                })
+                .collect();
+            move_all_or_rollback(&moves)?;
+        } else {
+            for source in sources {
+                remove_path(&source)?;
             }
         }
 
@@ -325,6 +344,62 @@ impl DialogueStore {
             self.refresh();
         }
 
+        Ok(())
+    }
+
+    fn active_paths(&self, id: &str) -> Vec<PathBuf> {
+        vec![
+            self.brain_dir.join(id),
+            self.conv_dir.join(format!("{}.db", id)),
+            self.conv_dir.join(format!("{}.db-wal", id)),
+            self.conv_dir.join(format!("{}.db-shm", id)),
+            self.annot_dir.join(format!("{}.pbtxt", id)),
+            self.presence_dir.join(format!("{}.lock", id)),
+        ]
+    }
+
+    fn delete_external(
+        &mut self,
+        item: &DialogueItem,
+        use_trash: bool,
+        refresh: bool,
+    ) -> Result<()> {
+        let source = item
+            .transcript_path
+            .as_ref()
+            .filter(|p| p.is_file())
+            .ok_or_else(|| AppError::General("Dialogue transcript not found".to_string()))?;
+        if !use_trash {
+            fs::remove_file(source)?;
+        } else {
+            let folder = self
+                .trash_dir
+                .join(format!("external-{}", crate::canonical::uuid_v4_simple()));
+            fs::create_dir_all(&self.trash_dir)?;
+            fs::create_dir(&folder)?;
+            let mut trashed_item = item.clone();
+            trashed_item.deleted_at = Some(chrono::Utc::now().to_rfc3339());
+            let manifest = TrashManifest {
+                item: trashed_item,
+                original_transcript: std::path::absolute(source)?,
+            };
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(folder.join("manifest.json"))?;
+            serde_json::to_writer_pretty(&mut file, &manifest)?;
+            file.sync_all()?;
+            if let Err(error) =
+                move_without_overwrite(source, &archived_transcript_path(&folder, source))
+            {
+                let _ = fs::remove_file(folder.join("manifest.json"));
+                let _ = fs::remove_dir(&folder);
+                return Err(error);
+            }
+        }
+        if refresh {
+            self.refresh();
+        }
         Ok(())
     }
 
@@ -348,50 +423,57 @@ impl DialogueStore {
             _ => return Err(AppError::General("Trash folder not found".to_string())),
         };
 
-        fs::create_dir_all(&self.brain_dir)?;
-        fs::create_dir_all(&self.conv_dir)?;
-        fs::create_dir_all(&self.annot_dir)?;
-        fs::create_dir_all(&self.presence_dir)?;
-
-        let trash_brain = folder.join("brain");
-        if trash_brain.is_dir() {
-            let target_brain = self.brain_dir.join(&item.id);
-            if target_brain.exists() {
-                let _ = fs::remove_dir_all(&target_brain);
+        self.validate_trash_folder(folder)?;
+        if item.agent != AgentKind::Antigravity {
+            let manifest: TrashManifest =
+                serde_json::from_reader(File::open(folder.join("manifest.json"))?)?;
+            if manifest.item.id != item.id || manifest.item.agent != item.agent {
+                return Err(AppError::General(
+                    "Trash manifest does not match the selected dialogue".to_string(),
+                ));
             }
-            fs::rename(&trash_brain, target_brain)?;
-        }
-
-        if let Ok(entries) = fs::read_dir(folder) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
-                    let target_dir = if fname.ends_with(".db")
-                        || fname.ends_with(".db-wal")
-                        || fname.ends_with(".db-shm")
-                    {
-                        Some(&self.conv_dir)
-                    } else if fname.ends_with(".pbtxt") {
-                        Some(&self.annot_dir)
-                    } else if fname.ends_with(".lock") {
-                        Some(&self.presence_dir)
+            let source = archived_transcript_path(folder, &manifest.original_transcript);
+            move_all_or_rollback(&[(source, manifest.original_transcript)])?;
+            fs::remove_file(folder.join("manifest.json"))?;
+        } else {
+            validate_session_id(&item.id)?;
+            let destinations = self.active_paths(&item.id);
+            for destination in &destinations {
+                ensure_absent(destination)?;
+            }
+            let moves: Vec<_> = destinations
+                .into_iter()
+                .filter_map(|destination| {
+                    let source = if destination == self.brain_dir.join(&item.id) {
+                        folder.join("brain")
                     } else {
-                        None
+                        folder.join(
+                            destination
+                                .file_name()
+                                .expect("session path has a filename"),
+                        )
                     };
-
-                    if let Some(dir) = target_dir {
-                        let dst = dir.join(fname);
-                        if dst.exists() {
-                            let _ = fs::remove_file(&dst);
-                        }
-                        let _ = fs::rename(&p, dst);
-                    }
-                }
+                    path_exists(&source).then_some((source, destination))
+                })
+                .collect();
+            if moves.is_empty() {
+                return Err(AppError::General(
+                    "No dialogue files found in trash".to_string(),
+                ));
             }
+            move_all_or_rollback(&moves)?;
         }
-
-        let _ = fs::remove_dir_all(folder);
+        fs::remove_dir(folder)?;
         self.refresh();
+        Ok(())
+    }
+
+    fn validate_trash_folder(&self, folder: &Path) -> Result<()> {
+        let root = fs::canonicalize(&self.trash_dir)?;
+        let resolved = fs::canonicalize(folder)?;
+        if resolved.parent() != Some(root.as_path()) {
+            return Err(AppError::General("Invalid trash folder".to_string()));
+        }
         Ok(())
     }
 
@@ -403,6 +485,8 @@ impl DialogueStore {
             Some(f) if f.exists() => f,
             _ => return Err(AppError::General("Trash folder not found".to_string())),
         };
+
+        self.validate_trash_folder(folder)?;
 
         if folder.is_dir() {
             fs::remove_dir_all(folder)?;
@@ -430,13 +514,9 @@ impl DialogueStore {
     pub fn empty_trash(&mut self) -> Result<usize> {
         let mut count = 0;
         if self.trash_dir.is_dir() {
-            for entry in fs::read_dir(&self.trash_dir)?.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let _ = fs::remove_dir_all(&path);
-                } else {
-                    let _ = fs::remove_file(&path);
-                }
+            for entry in fs::read_dir(&self.trash_dir)? {
+                let path = entry?.path();
+                remove_path(&path)?;
                 count += 1;
             }
         }
@@ -496,11 +576,7 @@ impl DialogueStore {
                     })
                     .take(40)
                     .collect();
-                let short_id = if item.id.len() >= 8 {
-                    &item.id[..8]
-                } else {
-                    &item.id
-                };
+                let short_id: String = item.id.chars().take(8).collect();
                 out_dir.join(format!("dialogue_{}_{}.md", short_id, safe_topic))
             }
         };
@@ -539,22 +615,135 @@ impl DialogueStore {
                 "assistant" => {
                     writeln!(
                         file,
-                        "### 🤖 Antigravity{}\n\n{}\n\n---\n",
-                        time_str, step.content
+                        "### 🤖 {}{}\n\n{}\n\n---\n",
+                        item.agent.display_name(),
+                        time_str,
+                        step.content
                     )?;
                 }
-                "tool_call" => {
-                    for tc in step.tool_calls {
-                        writeln!(file, "> 🛠️ **Tool Call `{}`**{}\n\n", tc.name, time_str)?;
-                    }
-                    writeln!(file, "---\n")?;
-                }
+                "tool_call" => writeln!(file, "### 🛠️ Tool{}\n\n{}\n", time_str, step.content)?,
+                "system" => writeln!(file, "### System{}\n\n{}\n", time_str, step.content)?,
                 _ => {}
+            }
+            for tc in &step.tool_calls {
+                writeln!(
+                    file,
+                    "> 🛠️ **Tool Call `{}`**{}\n\n{}\n",
+                    tc.name, time_str, tc.args
+                )?;
+                if let Some(result) = &tc.result {
+                    writeln!(file, "{}\n", result)?;
+                }
             }
         }
 
         Ok(out_path)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct TrashManifest {
+    item: DialogueItem,
+    original_transcript: PathBuf,
+}
+
+fn archived_transcript_path(folder: &Path, original: &Path) -> PathBuf {
+    folder.join(
+        if original.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            "transcript.json"
+        } else {
+            "transcript.jsonl"
+        },
+    )
+}
+
+fn validate_session_id(id: &str) -> Result<()> {
+    let mut components = Path::new(id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+        || id.contains('\\')
+    {
+        return Err(AppError::General("Invalid dialogue ID".to_string()));
+    }
+    Ok(())
+}
+
+fn path_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn ensure_absent(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(AppError::General(format!(
+            "Destination already exists: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    if fs::symlink_metadata(path)?.file_type().is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn move_without_overwrite(source: &Path, destination: &Path) -> Result<()> {
+    ensure_absent(destination)?;
+    if fs::symlink_metadata(source)?.file_type().is_dir() {
+        fs::rename(source, destination)?;
+        return Ok(());
+    }
+    if fs::hard_link(source, destination).is_err() {
+        let mut input = File::open(source)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        if let Err(error) = std::io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
+            let _ = fs::remove_file(destination);
+            return Err(error.into());
+        }
+    }
+    if let Err(error) = fs::remove_file(source) {
+        let _ = fs::remove_file(destination);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn move_all_or_rollback(moves: &[(PathBuf, PathBuf)]) -> Result<()> {
+    for (source, destination) in moves {
+        fs::symlink_metadata(source)?;
+        ensure_absent(destination)?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    for (index, (source, destination)) in moves.iter().enumerate() {
+        if let Err(error) = move_without_overwrite(source, destination) {
+            let mut rollback_errors = Vec::new();
+            for (original, moved) in moves[..index].iter().rev() {
+                if let Err(rollback) = move_without_overwrite(moved, original) {
+                    rollback_errors.push(rollback.to_string());
+                }
+            }
+            return Err(AppError::General(if rollback_errors.is_empty() {
+                error.to_string()
+            } else {
+                format!(
+                    "{}; some files could not be rolled back: {}",
+                    error,
+                    rollback_errors.join("; ")
+                )
+            }));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -579,9 +768,9 @@ impl DialogueMeta {
                 self.user_messages.push(cleaned);
                 self.user_msgs_count += 1;
             }
-        } else if parsed.is_model()
-            && !parsed.content.is_empty()
-            && !is_system_noise(&parsed.content)
+        } else if (parsed.is_model() || parsed.is_tool())
+            && ((!parsed.content.is_empty() && !is_system_noise(&parsed.content))
+                || !parsed.tool_calls.is_empty())
         {
             self.model_msgs_count += 1;
         }
@@ -619,11 +808,7 @@ impl ParsedRawStep {
         } else {
             None
         };
-        let time = if dt.len() >= 19 {
-            dt[11..19].to_string()
-        } else {
-            String::new()
-        };
+        let time = dt.get(11..19).unwrap_or_default().to_string();
 
         let mut content = val
             .get("content")
@@ -648,7 +833,7 @@ impl ParsedRawStep {
             }
         }
 
-        if stype.is_empty() && ssrc.is_empty() {
+        if ssrc.is_empty() && (stype.is_empty() || stype == "response_item") {
             let role = val
                 .get("message")
                 .and_then(|m| m.get("role"))
@@ -663,6 +848,12 @@ impl ParsedRawStep {
             } else if role == "assistant" || role == "model" {
                 ssrc = "MODEL".to_string();
                 stype = "PLANNER_RESPONSE".to_string();
+            } else if matches!(role, "tool_call" | "toolcall" | "tool") {
+                ssrc = "TOOL".to_string();
+                stype = "TOOL_CALL".to_string();
+            } else if role == "system" || role == "developer" {
+                ssrc = "SYSTEM".to_string();
+                stype = "SYSTEM_EVENT".to_string();
             }
         } else if (stype == "user" || stype == "assistant") && ssrc.is_empty() {
             if stype == "user" {
@@ -675,22 +866,86 @@ impl ParsedRawStep {
         }
 
         let mut tool_calls = Vec::new();
-        if let Some(tcs) = val.get("tool_calls").and_then(|v| v.as_array()) {
+        if let Some(tcs) = val
+            .get("tool_calls")
+            .or_else(|| val.get("message").and_then(|m| m.get("tool_calls")))
+            .or_else(|| val.get("payload").and_then(|m| m.get("tool_calls")))
+            .and_then(|v| v.as_array())
+        {
             for tc in tcs {
                 let name = tc
                     .get("function")
                     .and_then(|f| f.get("name"))
+                    .or_else(|| tc.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or("tool")
                     .to_string();
                 let args = tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                tool_calls.push(ToolCall { name, args });
+                    .or_else(|| tc.get("args"))
+                    .map(|args| {
+                        args.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| args.to_string())
+                    })
+                    .unwrap_or_default();
+                let result = tc.get("result").and_then(Value::as_str).map(str::to_string);
+                tool_calls.push(ToolCall { name, args, result });
             }
+        }
+        let message = val
+            .get("message")
+            .or_else(|| val.get("payload"))
+            .unwrap_or(val);
+        if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    tool_calls.push(ToolCall {
+                        name: block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_string(),
+                        args: block.get("input").map(Value::to_string).unwrap_or_default(),
+                        result: None,
+                    });
+                }
+            }
+        }
+        if val.get("type").and_then(Value::as_str) == Some("response_item")
+            && message.get("type").and_then(Value::as_str) == Some("function_call")
+        {
+            ssrc = "TOOL".to_string();
+            stype = "TOOL_CALL".to_string();
+            tool_calls.push(ToolCall {
+                name: message
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string(),
+                args: message
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                result: None,
+            });
+        }
+        if val.get("type").and_then(Value::as_str) == Some("response_item")
+            && message.get("type").and_then(Value::as_str) == Some("function_call_output")
+        {
+            ssrc = "TOOL".to_string();
+            stype = "TOOL_CALL".to_string();
+            content = message
+                .get("output")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_default();
         }
 
         Self {
@@ -711,6 +966,10 @@ impl ParsedRawStep {
         self.stype == "PLANNER_RESPONSE" || self.ssrc == "MODEL"
     }
 
+    fn is_tool(&self) -> bool {
+        self.stype == "TOOL_CALL" || self.ssrc == "TOOL"
+    }
+
     fn into_dialogue_step(self) -> Option<DialogueStep> {
         if self.is_user() {
             let cleaned = clean_user_content(&self.content);
@@ -718,26 +977,36 @@ impl ParsedRawStep {
                 return Some(DialogueStep {
                     role: "user".to_string(),
                     time: self.time,
+                    timestamp: self.created_at,
                     content: cleaned,
                     tool_calls: Vec::new(),
                 });
             }
         } else if self.is_model() {
-            if !self.content.is_empty() && !is_system_noise(&self.content) {
+            if (!self.content.is_empty() && !is_system_noise(&self.content))
+                || !self.tool_calls.is_empty()
+            {
                 return Some(DialogueStep {
                     role: "assistant".to_string(),
                     time: self.time,
+                    timestamp: self.created_at,
                     content: self.content.trim().to_string(),
                     tool_calls: self.tool_calls,
                 });
-            } else if !self.tool_calls.is_empty() {
-                return Some(DialogueStep {
-                    role: "tool_call".to_string(),
-                    time: self.time,
-                    content: String::new(),
-                    tool_calls: self.tool_calls,
-                });
             }
+        } else if self.is_tool() || self.ssrc == "SYSTEM" || self.stype == "SYSTEM_EVENT" {
+            return Some(DialogueStep {
+                role: if self.is_tool() {
+                    "tool_call"
+                } else {
+                    "system"
+                }
+                .to_string(),
+                time: self.time,
+                timestamp: self.created_at,
+                content: self.content,
+                tool_calls: self.tool_calls,
+            });
         }
         None
     }
@@ -924,4 +1193,217 @@ fn get_dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ai-dialogs-storage-{}",
+                crate::canonical::uuid_v4_simple()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn store(&self) -> DialogueStore {
+            DialogueStore::with_base_dir(self.0.join("antigravity"))
+        }
+
+        fn active(&self, id: &str) -> (DialogueStore, DialogueItem) {
+            let mut store = self.store();
+            let brain = store.brain_dir.join(id);
+            fs::create_dir_all(&brain).unwrap();
+            fs::create_dir_all(&store.conv_dir).unwrap();
+            fs::write(
+                brain.join("transcript.jsonl"),
+                "{\"source\":\"USER_EXPLICIT\",\"content\":\"old conversation\"}\n",
+            )
+            .unwrap();
+            fs::write(store.conv_dir.join(format!("{}.db", id)), "old database").unwrap();
+            store.refresh();
+            let item = store.items[0].clone();
+            (store, item)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn restore_refuses_active_brain_without_touching_either_copy() {
+        let fixture = Fixture::new();
+        let (mut store, item) = fixture.active("session_with_underscores");
+        store.delete(&item, true, true).unwrap();
+        let trashed = store.trash_items[0].clone();
+        assert_eq!(trashed.id, item.id);
+        fs::create_dir_all(&item.brain_path).unwrap();
+        fs::write(item.brain_path.join("new-data"), "new conversation").unwrap();
+        assert!(store.restore(&trashed).is_err());
+        assert_eq!(
+            fs::read_to_string(item.brain_path.join("new-data")).unwrap(),
+            "new conversation"
+        );
+        assert_eq!(
+            fs::read_to_string(&trashed.db_path).unwrap(),
+            "old database"
+        );
+        assert!(trashed.transcript_path.unwrap().is_file());
+    }
+
+    #[test]
+    fn restore_refuses_companion_directory_and_keeps_entire_backup() {
+        let fixture = Fixture::new();
+        let (mut store, item) = fixture.active("session");
+        store.delete(&item, true, true).unwrap();
+        let trashed = store.trash_items[0].clone();
+        fs::create_dir(&item.db_path).unwrap();
+        assert!(store.restore(&trashed).is_err());
+        assert!(item.db_path.is_dir());
+        assert!(!item.brain_path.exists());
+        assert_eq!(
+            fs::read_to_string(&trashed.db_path).unwrap(),
+            "old database"
+        );
+        assert!(trashed.brain_path.is_dir());
+    }
+
+    #[test]
+    fn restore_failure_to_create_parent_retains_backup() {
+        let fixture = Fixture::new();
+        let (mut store, item) = fixture.active("session");
+        store.delete(&item, true, true).unwrap();
+        let trashed = store.trash_items[0].clone();
+        fs::remove_dir(&store.conv_dir).unwrap();
+        fs::write(&store.conv_dir, "not a directory").unwrap();
+        assert!(store.restore(&trashed).is_err());
+        assert!(trashed.brain_path.is_dir());
+        assert_eq!(
+            fs::read_to_string(&trashed.db_path).unwrap(),
+            "old database"
+        );
+        assert!(!item.brain_path.exists());
+    }
+
+    #[test]
+    fn failed_later_move_rolls_back_earlier_moves() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let moved = fixture.0.join("moved");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("child"), "recoverable").unwrap();
+        let moves = vec![
+            (source.clone(), moved.clone()),
+            (source.join("child"), fixture.0.join("child")),
+        ];
+        assert!(move_all_or_rollback(&moves).is_err());
+        assert_eq!(
+            fs::read_to_string(source.join("child")).unwrap(),
+            "recoverable"
+        );
+        assert!(!moved.exists());
+    }
+
+    #[test]
+    fn external_delete_restore_only_moves_the_selected_provider() {
+        let fixture = Fixture::new();
+        let (mut store, agy) = fixture.active("same-id");
+        let source = fixture.0.join("universal.json");
+        fs::write(
+            &source,
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"external prompt\"}]}",
+        )
+        .unwrap();
+        let external = DialogueItem::new_external(
+            "same-id".to_string(),
+            AgentKind::Universal,
+            "external".to_string(),
+            None,
+            1,
+            0,
+            0,
+            Some(source.clone()),
+        )
+        .with_user_messages(vec!["external prompt".to_string()]);
+        store.delete(&external, true, true).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&agy.db_path).unwrap(), "old database");
+        assert!(agy.brain_path.is_dir());
+        let trashed = store
+            .trash_items
+            .iter()
+            .find(|it| it.agent == AgentKind::Universal)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            store.load_conversation_steps(&trashed)[0].content,
+            "external prompt"
+        );
+        fs::write(&source, "new external conversation").unwrap();
+        assert!(store.restore(&trashed).is_err());
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "new external conversation"
+        );
+        assert!(trashed.transcript_path.as_ref().unwrap().is_file());
+        fs::remove_file(&source).unwrap();
+        store.restore(&trashed).unwrap();
+        assert!(source.is_file());
+        assert!(store.trash_items.is_empty());
+        assert_eq!(fs::read_to_string(&agy.db_path).unwrap(), "old database");
+    }
+
+    #[test]
+    fn codex_wrapped_messages_are_visible_and_exported() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let source = fixture.0.join("rollout.jsonl");
+        let records = [
+            json!({"type":"session_meta", "payload":{"id":"session"}}),
+            json!({"type":"response_item", "timestamp":"2025-03-04T05:06:07+02:00", "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"question"}]}}),
+            json!({"type":"response_item", "timestamp":"2025-03-04T05:06:08+02:00", "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}),
+        ];
+        fs::write(
+            &source,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let item = DialogueItem::new_external(
+            "session".to_string(),
+            AgentKind::Codex,
+            "title".to_string(),
+            None,
+            1,
+            1,
+            0,
+            Some(source),
+        );
+        let steps = store.load_conversation_steps(&item);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].role, "user");
+        assert_eq!(
+            steps[0].timestamp.as_deref(),
+            Some("2025-03-04T05:06:07+02:00")
+        );
+        assert_eq!(steps[1].role, "assistant");
+        let output = fixture.0.join("export.md");
+        store.export_to_markdown(&item, Some(&output)).unwrap();
+        let markdown = fs::read_to_string(output).unwrap();
+        assert!(markdown.contains("question"));
+        assert!(markdown.contains("answer"));
+        assert!(markdown.contains("OpenAI Codex"));
+    }
 }

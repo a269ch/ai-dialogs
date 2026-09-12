@@ -34,7 +34,14 @@ impl TransferEngine {
             AppError::General(format!("Target provider not found: {}", target_agent))
         })?;
 
-        let mut dialogue = source_provider.load_canonical(dialogue_id)?;
+        let (_, source_item) = registry
+            .find_dialogue_in(dialogue_id, Some(source_agent))?
+            .ok_or_else(|| AppError::NotFound(dialogue_id.to_string()))?;
+        let mut dialogue = source_provider.load_canonical(&source_item.id)?;
+        dialogue
+            .metadata
+            .original_id
+            .get_or_insert_with(|| source_item.id.clone());
         dialogue.source_agent = target_agent;
 
         let user_count = dialogue.user_messages_count();
@@ -47,7 +54,7 @@ impl TransferEngine {
         Ok(TransferResult {
             source_agent,
             target_agent,
-            source_id: dialogue_id.to_string(),
+            source_id: source_item.id,
             target_id: new_id,
             title,
             messages_count: total_count,
@@ -93,7 +100,11 @@ mod tests {
 
     #[test]
     fn test_transfer_save_and_load_roundtrip() {
-        let registry = ProviderRegistry::new();
+        let dir = crate::test_support::TestDir::new("transfer");
+        let mut registry = ProviderRegistry::empty();
+        registry.register(Box::new(UniversalProvider::with_base_dir(
+            dir.path().join("sessions"),
+        )));
         let mut dialogue = CanonicalDialogue::new(
             "transfer-test-1",
             "Solve LeetCode problem in Rust",

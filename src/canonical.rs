@@ -89,6 +89,7 @@ pub enum CanonicalRole {
     System,
     User,
     Assistant,
+    #[serde(rename = "tool_call", alias = "toolcall")]
     ToolCall,
 }
 
@@ -107,7 +108,7 @@ impl CanonicalRole {
             "system" => Self::System,
             "user" | "human" => Self::User,
             "assistant" | "model" | "agent" => Self::Assistant,
-            "tool_call" | "tool" | "call" => Self::ToolCall,
+            "tool_call" | "toolcall" | "tool" | "call" => Self::ToolCall,
             _ => Self::User,
         }
     }
@@ -217,25 +218,28 @@ impl CanonicalDialogue {
 }
 
 pub fn uuid_v4_simple() -> String {
-    use std::time::SystemTime;
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let nanos = duration.as_nanos();
-    let rand_val = (nanos ^ (nanos >> 32)) as u64;
-    format!(
-        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
-        (nanos & 0xFFFF_FFFF) as u32,
-        ((nanos >> 32) & 0xFFFF) as u16,
-        ((rand_val >> 16) & 0x0FFF) as u16,
-        ((rand_val >> 32) & 0x0FFF) as u16,
-        rand_val & 0xFFFF_FFFF_FFFF
-    )
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_session_ids_do_not_depend_on_clock_resolution() {
+        let workers: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..1000).map(|_| uuid_v4_simple()).collect::<Vec<_>>()))
+            .collect();
+        let ids: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+        for id in ids {
+            assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 4);
+        }
+    }
 
     #[test]
     fn test_canonical_dialogue_roundtrip() {
@@ -275,5 +279,20 @@ mod tests {
             Some(AgentKind::Universal)
         );
         assert_eq!(AgentKind::parse_str("unknown"), None);
+    }
+
+    #[test]
+    fn tool_role_supports_canonical_and_legacy_spellings() {
+        assert_eq!(
+            serde_json::to_string(&CanonicalRole::ToolCall).unwrap(),
+            "\"tool_call\""
+        );
+        for value in ["tool_call", "toolcall"] {
+            assert_eq!(
+                serde_json::from_value::<CanonicalRole>(serde_json::json!(value)).unwrap(),
+                CanonicalRole::ToolCall
+            );
+            assert_eq!(CanonicalRole::parse_str(value), CanonicalRole::ToolCall);
+        }
     }
 }

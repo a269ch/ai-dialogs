@@ -5,7 +5,7 @@ pub mod grok;
 pub mod universal;
 
 use crate::canonical::{AgentKind, CanonicalDialogue};
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::models::DialogueItem;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +33,16 @@ impl Default for ProviderRegistry {
 }
 
 impl ProviderRegistry {
+    pub fn empty() -> Self {
+        Self {
+            providers: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, provider: Box<dyn DialogueProvider>) {
+        self.providers.insert(provider.kind(), provider);
+    }
+
     pub fn new() -> Self {
         let mut providers: HashMap<AgentKind, Box<dyn DialogueProvider>> = HashMap::new();
         providers.insert(
@@ -80,19 +90,94 @@ impl ProviderRegistry {
         all
     }
 
-    pub fn find_dialogue(&self, id: &str) -> Option<(&dyn DialogueProvider, DialogueItem)> {
+    pub fn list_dialogues(&self, filter: Option<AgentKind>) -> Result<Vec<DialogueItem>> {
+        let mut items = Vec::new();
         for kind in AgentKind::ALL {
-            if let Some(provider) = self.providers.get(&kind)
+            if filter.is_some_and(|selected| selected != kind) {
+                continue;
+            }
+            if let Some(provider) = self.get(kind)
                 && provider.is_available()
-                && let Ok(items) = provider.list_dialogues()
             {
-                for it in items {
-                    if it.id == id || it.id.starts_with(id) {
-                        return Some((provider.as_ref(), it));
-                    }
-                }
+                items.extend(provider.list_dialogues()?);
             }
         }
-        None
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(items)
+    }
+
+    pub fn find_dialogue_in(
+        &self,
+        id: &str,
+        filter: Option<AgentKind>,
+    ) -> Result<Option<(&dyn DialogueProvider, DialogueItem)>> {
+        let items = self.list_dialogues(filter)?;
+        Ok(resolve_dialogue(&items, id, filter)?.and_then(|item| {
+            self.get(item.agent)
+                .map(|provider| (provider, item.clone()))
+        }))
+    }
+
+    pub fn find_dialogue(&self, id: &str) -> Option<(&dyn DialogueProvider, DialogueItem)> {
+        self.find_dialogue_in(id, None).ok().flatten()
+    }
+}
+
+pub fn resolve_dialogue<'a>(
+    items: &'a [DialogueItem],
+    id: &str,
+    filter: Option<AgentKind>,
+) -> Result<Option<&'a DialogueItem>> {
+    if id.is_empty() {
+        return Err(AppError::General("Dialogue ID cannot be empty".into()));
+    }
+    let candidates: Vec<_> = items
+        .iter()
+        .filter(|item| filter.is_none_or(|kind| item.agent == kind) && item.id.starts_with(id))
+        .collect();
+    let exact: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|item| item.id == id)
+        .collect();
+    let matches = if exact.is_empty() {
+        &candidates
+    } else {
+        &exact
+    };
+    match matches.as_slice() {
+        [] => Ok(None),
+        [item] => Ok(Some(item)),
+        _ => Err(AppError::General(format!(
+            "Ambiguous dialogue ID '{}'; specify --provider and a unique ID (or trash backup)",
+            id
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: &str, agent: AgentKind) -> DialogueItem {
+        DialogueItem::new_external(id.into(), agent, "Title".into(), None, 1, 0, 0, None)
+    }
+
+    #[test]
+    fn resolution_rejects_ambiguous_ids_and_prefers_exact_matches() {
+        let items = [
+            item("shared", AgentKind::Claude),
+            item("shared", AgentKind::Universal),
+            item("shared-long", AgentKind::Universal),
+        ];
+        assert!(resolve_dialogue(&items, "shared", None).is_err());
+        assert!(resolve_dialogue(&items, "sh", Some(AgentKind::Universal)).is_err());
+        let selected = resolve_dialogue(&items, "shared", Some(AgentKind::Universal))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.agent, AgentKind::Universal);
+        assert_eq!(selected.id, "shared");
+        assert!(resolve_dialogue(&items, "missing", None).unwrap().is_none());
+        assert!(resolve_dialogue(&items, "", None).is_err());
     }
 }

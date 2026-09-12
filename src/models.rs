@@ -6,18 +6,22 @@ use std::path::PathBuf;
 pub struct ToolCall {
     pub name: String,
     pub args: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueStep {
     pub role: String,
     pub time: String,
+    #[serde(default)]
+    pub timestamp: Option<String>,
     pub content: String,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueItem {
     pub id: String,
     pub agent: AgentKind,
@@ -44,6 +48,12 @@ pub struct DialogueItem {
 }
 
 impl DialogueItem {
+    pub fn with_user_messages(mut self, messages: Vec<String>) -> Self {
+        self.first_user_msg = messages.first().cloned().unwrap_or_default();
+        self.user_messages = messages;
+        self
+    }
+
     pub fn date_str(&self) -> String {
         crate::cleaner::format_date(self.created_at.as_deref())
     }

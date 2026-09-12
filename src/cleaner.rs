@@ -69,10 +69,8 @@ pub fn format_date(dt_str: Option<&str>) -> String {
         Some(dt) if !dt.is_empty() => {
             if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(dt) {
                 parsed.format("%Y-%m-%d %H:%M").to_string()
-            } else if dt.len() >= 16 {
-                dt[..16].replace('T', " ")
             } else {
-                dt.to_string()
+                dt.chars().take(16).collect::<String>().replace('T', " ")
             }
         }
         _ => "----/--/-- --:--".to_string(),
@@ -117,5 +115,9 @@ mod tests {
             "2026-09-11 16:10"
         );
         assert_eq!(format_date(None), "----/--/-- --:--");
+        assert_eq!(
+            format_date(Some("İstanbul — дата неизвестна")),
+            "İstanbul — дата "
+        );
     }
 }

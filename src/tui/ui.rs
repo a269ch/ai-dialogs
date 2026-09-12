@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Row, Table}
 use unicode_width::UnicodeWidthStr;
 
 use crate::cleaner::format_bytes;
-use crate::tui::app::{App, line_to_string, slice_spans};
+use crate::tui::app::{App, case_insensitive_match_ranges, line_to_string, slice_spans};
 
 pub fn draw_app(f: &mut Frame, app: &mut App) {
     let size = f.area();
@@ -403,13 +403,11 @@ fn draw_viewer(f: &mut Frame, app: &mut App) {
     };
 
     let content_w = chunks[1].width as usize;
-    if viewer.rendered_width != content_w && content_w >= 30 {
-        viewer.rebuild_rendered_lines(content_w);
-    }
+    let content_h = chunks[1].height as usize;
+    viewer.set_viewport(content_w, content_h);
 
     let is_trash = viewer.item.is_in_trash;
     let total_lines = viewer.rendered_lines.len();
-    let content_h = chunks[1].height as usize;
     let max_y = viewer.max_scroll_y(content_h);
     let pct = (viewer.scroll_y * 100).checked_div(max_y).unwrap_or(100);
 
@@ -530,42 +528,38 @@ fn draw_viewer(f: &mut Frame, app: &mut App) {
 
 fn highlight_search_in_line(line: &Line, search_kw: &str) -> Vec<Span<'static>> {
     let full_text = line_to_string(line);
-    let q = search_kw.to_lowercase();
-    if !full_text.to_lowercase().contains(&q) {
-        return line
-            .spans
-            .iter()
-            .map(|s| Span::styled(s.content.to_string(), s.style))
-            .collect();
-    }
-
+    let matches = case_insensitive_match_ranges(&full_text, search_kw);
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let mut new_spans = Vec::new();
+    let mut span_start = 0;
     for span in &line.spans {
         let content = span.content.as_ref();
-        let content_lower = content.to_lowercase();
-        if !content_lower.contains(&q) {
-            new_spans.push(Span::styled(content.to_string(), span.style));
-            continue;
-        }
-
+        let span_end = span_start + content.len();
         let mut last = 0;
-        for (idx, _) in content_lower.match_indices(&q) {
-            if idx > last {
-                new_spans.push(Span::styled(content[last..idx].to_string(), span.style));
+        for matched in &matches {
+            let start = matched.start.max(span_start);
+            let end = matched.end.min(span_end);
+            if start >= end {
+                continue;
             }
-            let end = idx + search_kw.len();
+            let start = start - span_start;
+            let end = end - span_start;
+            if start > last {
+                new_spans.push(Span::styled(content[last..start].to_string(), span.style));
+            }
             new_spans.push(Span::styled(
-                content[idx..end].to_string(),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                content[start..end].to_string(),
+                span.style.patch(highlight),
             ));
             last = end;
         }
         if last < content.len() {
             new_spans.push(Span::styled(content[last..].to_string(), span.style));
         }
+        span_start = span_end;
     }
 
     new_spans
@@ -836,4 +830,53 @@ fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
     let x = r.x + (r.width.saturating_sub(w)) / 2;
     let y = r.y + (r.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn highlights_unicode_matches_on_original_character_boundaries() {
+        for (text, query, expected) in [
+            ("İstanbul", "i", "İ"),
+            ("Ⱥbc ⱥ", "ⱥ", "Ⱥⱥ"),
+            ("i\u{307}stanbul", "İ", "i\u{307}"),
+            ("İİ", "i", "İİ"),
+            ("Москва", "МОС", "Мос"),
+            ("plain text", "", ""),
+        ] {
+            let spans = highlight_search_in_line(&Line::from(text), query);
+            let reconstructed: String = spans.iter().map(|span| span.content.as_ref()).collect();
+            let highlighted: String = spans
+                .iter()
+                .filter(|span| span.style.bg == Some(Color::Yellow))
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(reconstructed, text);
+            assert_eq!(highlighted, expected);
+        }
+    }
+
+    #[test]
+    fn matches_cross_styled_spans_and_preserve_unmatched_styles() {
+        let italic = Style::default().add_modifier(Modifier::ITALIC);
+        let line = Line::from(vec![
+            Span::styled("istan", Style::default().fg(Color::Cyan)),
+            Span::styled("bul and ", italic),
+            Span::raw("ISTANBUL"),
+        ]);
+        let spans = highlight_search_in_line(&line, "istanbul");
+        let highlighted: String = spans
+            .iter()
+            .filter(|span| span.style.bg == Some(Color::Yellow))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(highlighted, "istanbulISTANBUL");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content == " and " && span.style == italic)
+        );
+    }
 }

@@ -32,8 +32,8 @@ impl Drop for TerminalGuard {
 
 pub fn run_tui() -> Result<(), io::Error> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
     let _guard = TerminalGuard;
+    execute!(stdout(), EnterAlternateScreen)?;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -105,6 +105,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent, term_width: usize) {
     }
 
     if let Some(ref mut viewer) = app.viewer {
+        let content_height = viewer.content_height;
         if viewer.is_searching {
             if let Some(action) = map_viewer_search_key(key) {
                 match action {
@@ -115,7 +116,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent, term_width: usize) {
                     Action::ViewerSearchSubmit => {
                         viewer.search_kw = viewer.search_input.clone();
                         viewer.is_searching = false;
-                        viewer.find_next(24);
+                        viewer.find_next(content_height);
                     }
                     Action::ViewerSearchBackspace => {
                         viewer.search_input.pop();
@@ -133,29 +134,38 @@ fn handle_key_event(app: &mut App, key: KeyEvent, term_width: usize) {
         if let Some(action) = map_viewer_key(key, is_trash) {
             match action {
                 Action::ViewerScrollUp(n) => viewer.scroll_up(n),
-                Action::ViewerScrollDown(n) => viewer.scroll_down(n, 24),
+                Action::ViewerScrollDown(n) => viewer.scroll_down(n, content_height),
+                Action::ViewerPageUp => viewer.scroll_up(content_height.max(1)),
+                Action::ViewerPageDown => viewer.scroll_down(content_height.max(1), content_height),
                 Action::ViewerScrollLeft(n) => viewer.scroll_left(n),
                 Action::ViewerScrollRight(n) => viewer.scroll_right(n),
                 Action::ViewerHome => {
                     viewer.scroll_y = 0;
                     viewer.scroll_x = 0;
                 }
-                Action::ViewerEnd => viewer.scroll_y = viewer.max_scroll_y(24),
+                Action::ViewerEnd => viewer.scroll_y = viewer.max_scroll_y(content_height),
                 Action::Restore => {
                     let item_clone = viewer.item.clone();
-                    if app.store.restore(&item_clone).is_ok() {
-                        app.status_msg = format!("✅ Dialogue {} restored!", item_clone.id);
-                        app.close_viewer();
+                    match app.store.restore(&item_clone) {
+                        Ok(()) => {
+                            app.status_msg = format!("✅ Dialogue {} restored!", item_clone.id);
+                            app.close_viewer();
+                            app.refresh_all();
+                        }
+                        Err(e) => {
+                            app.status_msg = format!("Error restoring {}: {}", item_clone.id, e);
+                            app.close_viewer();
+                        }
                     }
                 }
-                Action::ViewerJumpUser => viewer.jump_next_user(24),
-                Action::ViewerJumpAssistant => viewer.jump_next_assistant(24),
+                Action::ViewerJumpUser => viewer.jump_next_user(content_height),
+                Action::ViewerJumpAssistant => viewer.jump_next_assistant(content_height),
                 Action::ViewerSearchStart => {
                     viewer.is_searching = true;
                     viewer.search_input.clear();
                 }
-                Action::ViewerFindNext => viewer.find_next(24),
-                Action::ViewerFindPrev => viewer.find_prev(24),
+                Action::ViewerFindNext => viewer.find_next(content_height),
+                Action::ViewerFindPrev => viewer.find_prev(content_height),
                 Action::Export => {
                     let item = viewer.item.clone();
                     match app.store.export_to_markdown(&item, None) {
@@ -323,5 +333,105 @@ fn handle_key_event(app: &mut App, key: KeyEvent, term_width: usize) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::AgentKind;
+    use crate::models::DialogueItem;
+    use crate::tui::app::{ViewerState, test_app};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::text::Line;
+
+    fn viewer_app() -> App {
+        let mut app = test_app(std::path::Path::new("unused-test-path"));
+        let item = DialogueItem::new_external(
+            "test".into(),
+            AgentKind::Universal,
+            "test".into(),
+            None,
+            1,
+            1,
+            0,
+            None,
+        );
+        let mut viewer = ViewerState::new(item, Vec::new(), 80);
+        viewer.rendered_lines = (0..59)
+            .map(|idx| Line::from(format!("line {idx}")))
+            .collect();
+        viewer.rendered_lines.push(Line::from("last line"));
+        viewer.user_jump_lines = vec![59];
+        viewer.assistant_jump_lines = vec![59];
+        app.viewer = Some(viewer);
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key_event(app, KeyEvent::new(code, KeyModifiers::NONE), 80);
+    }
+
+    #[test]
+    fn viewer_keys_use_rendered_viewport_and_reach_last_line() {
+        for height in [24, 40] {
+            let mut app = viewer_app();
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal.draw(|frame| draw_app(frame, &mut app)).unwrap();
+            let content_height = usize::from(height) - 2;
+            let max_scroll = 60 - content_height;
+            assert_eq!(app.viewer.as_ref().unwrap().content_height, content_height);
+
+            press(&mut app, KeyCode::End);
+            assert_eq!(app.viewer.as_ref().unwrap().scroll_y, max_scroll);
+            terminal.draw(|frame| draw_app(frame, &mut app)).unwrap();
+            assert_eq!(terminal.backend().buffer()[(0, height - 2)].symbol(), "l");
+
+            press(&mut app, KeyCode::Home);
+            for _ in 0..60 {
+                press(&mut app, KeyCode::Down);
+            }
+            assert_eq!(app.viewer.as_ref().unwrap().scroll_y, max_scroll);
+
+            press(&mut app, KeyCode::Home);
+            press(&mut app, KeyCode::PageDown);
+            assert_eq!(
+                app.viewer.as_ref().unwrap().scroll_y,
+                content_height.min(max_scroll)
+            );
+            press(&mut app, KeyCode::PageUp);
+            assert_eq!(app.viewer.as_ref().unwrap().scroll_y, 0);
+
+            for code in [KeyCode::Char('u'), KeyCode::Char('m')] {
+                press(&mut app, KeyCode::Home);
+                press(&mut app, code);
+                assert_eq!(app.viewer.as_ref().unwrap().scroll_y, max_scroll);
+            }
+            press(&mut app, KeyCode::Home);
+            press(&mut app, KeyCode::Char('/'));
+            app.viewer.as_mut().unwrap().search_input = "last".into();
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.viewer.as_ref().unwrap().scroll_y, max_scroll);
+            for code in [KeyCode::Char('n'), KeyCode::Char('N')] {
+                press(&mut app, KeyCode::Home);
+                press(&mut app, code);
+                assert_eq!(app.viewer.as_ref().unwrap().scroll_y, max_scroll);
+            }
+        }
+    }
+
+    #[test]
+    fn growing_viewport_clamps_existing_scroll_position() {
+        let mut app = viewer_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_app(frame, &mut app)).unwrap();
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll_y, 38);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|frame| draw_app(frame, &mut app)).unwrap();
+        assert_eq!(app.viewer.as_ref().unwrap().scroll_y, 22);
+        assert_eq!(terminal.backend().buffer()[(0, 38)].symbol(), "l");
     }
 }

@@ -9,4 +9,8 @@ pub mod storage;
 pub mod transfer;
 pub mod tui;
 
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+pub(crate) mod test_support;
+
 pub use error::{AppError, Result};

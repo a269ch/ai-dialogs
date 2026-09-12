@@ -24,6 +24,10 @@ impl ClaudeProvider {
         let base_dir = AgentKind::Claude
             .default_storage_dir()
             .unwrap_or_else(|| PathBuf::from("."));
+        Self::with_base_dir(base_dir)
+    }
+
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
 
@@ -97,6 +101,7 @@ impl DialogueProvider for ClaudeProvider {
             let mut model_count = 0;
             let mut first_user_msg = String::new();
             let mut created_at = None;
+            let mut user_messages = Vec::new();
 
             for line in reader.lines().map_while(std::result::Result::ok) {
                 let trimmed = line.trim();
@@ -104,6 +109,12 @@ impl DialogueProvider for ClaudeProvider {
                     continue;
                 }
                 if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                    if created_at.is_none() {
+                        created_at = val
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
                     let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let role = val
                         .get("message")
@@ -113,10 +124,8 @@ impl DialogueProvider for ClaudeProvider {
 
                     if msg_type == "user" || role == "user" {
                         user_count += 1;
-                        if created_at.is_none()
-                            && let Some(ts) = val.get("timestamp").and_then(|t| t.as_str())
-                        {
-                            created_at = Some(ts.to_string());
+                        if let Some(content) = extract_claude_text(&val) {
+                            user_messages.push(content);
                         }
                         if first_user_msg.is_empty()
                             && let Some(content) = extract_claude_text(&val)
@@ -140,7 +149,7 @@ impl DialogueProvider for ClaudeProvider {
                 "[Empty session]".to_string()
             };
 
-            let item = DialogueItem::new_external(
+            let mut item = DialogueItem::new_external(
                 stem,
                 AgentKind::Claude,
                 topic,
@@ -150,6 +159,7 @@ impl DialogueProvider for ClaudeProvider {
                 size,
                 Some(path),
             );
+            item.user_messages = user_messages;
             items.push(item);
         }
 
@@ -158,21 +168,19 @@ impl DialogueProvider for ClaudeProvider {
     }
 
     fn load_canonical(&self, id: &str) -> Result<CanonicalDialogue> {
-        let files = self.collect_jsonl_files();
-        let target_file = files
-            .into_iter()
-            .find(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|stem| stem == id || stem.starts_with(id))
-                    .unwrap_or(false)
-            })
+        let items = self.list_dialogues()?;
+        let item = crate::providers::resolve_dialogue(&items, id, Some(AgentKind::Claude))?
             .ok_or_else(|| AppError::General(format!("Claude dialogue not found: {}", id)))?;
-
-        let file = File::open(&target_file)?;
+        let target_file = item.transcript_path.as_ref().ok_or_else(|| {
+            AppError::General(format!("Claude dialogue has no transcript: {}", id))
+        })?;
+        let file = File::open(target_file)?;
         let reader = BufReader::new(file);
 
-        let mut dialogue = CanonicalDialogue::new(id, "Claude Dialogue", AgentKind::Claude);
+        let mut dialogue = CanonicalDialogue::new(&item.id, "Claude Dialogue", AgentKind::Claude);
+        dialogue.created_at = None;
+        dialogue.updated_at = None;
+        let mut stored_updated_at = None;
         let mut first_user_found = false;
 
         for line in reader.lines().map_while(std::result::Result::ok) {
@@ -181,6 +189,15 @@ impl DialogueProvider for ClaudeProvider {
                 continue;
             }
             if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(timestamp) = val.get("timestamp").and_then(Value::as_str) {
+                    dialogue
+                        .created_at
+                        .get_or_insert_with(|| timestamp.to_string());
+                    dialogue.updated_at = Some(timestamp.to_string());
+                }
+                if let Some(updated_at) = val.get("updated_at").and_then(Value::as_str) {
+                    stored_updated_at = Some(updated_at.to_string());
+                }
                 let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 let msg_obj = val.get("message");
                 let role_str = msg_obj
@@ -201,7 +218,8 @@ impl DialogueProvider for ClaudeProvider {
                 }
 
                 let text = extract_claude_text(&val).unwrap_or_default();
-                if text.is_empty() && val.get("tool_use").is_none() {
+                let tool_calls = extract_claude_tool_calls(&val);
+                if text.is_empty() && tool_calls.is_empty() {
                     continue;
                 }
 
@@ -223,8 +241,6 @@ impl DialogueProvider for ClaudeProvider {
                     .unwrap_or(&dialogue.id)
                     .to_string();
 
-                let tool_calls = extract_claude_tool_calls(&val);
-
                 dialogue.messages.push(CanonicalMessage {
                     id: msg_id,
                     role,
@@ -239,10 +255,17 @@ impl DialogueProvider for ClaudeProvider {
             }
         }
 
+        dialogue.updated_at = stored_updated_at.or(dialogue.updated_at);
+
         Ok(dialogue)
     }
 
     fn save_canonical(&self, dialogue: &CanonicalDialogue) -> Result<String> {
+        for message in &dialogue.messages {
+            for call in &message.tool_calls {
+                claude_tool_input(&call.args)?;
+            }
+        }
         let new_id = crate::canonical::uuid_v4_simple();
         let projects_dir = self.projects_dir();
 
@@ -261,12 +284,14 @@ impl DialogueProvider for ClaudeProvider {
 
         fs::create_dir_all(&target_dir)?;
         let session_file = target_dir.join(format!("{}.jsonl", new_id));
-        let mut file = File::create(&session_file)?;
+        let mut file = File::create_new(&session_file)?;
 
         let init_line = json!({
             "type": "mode",
             "mode": "normal",
             "sessionId": new_id,
+            "timestamp": dialogue.created_at,
+            "updated_at": dialogue.updated_at,
         });
         writeln!(file, "{}", serde_json::to_string(&init_line)?)?;
 
@@ -293,17 +318,18 @@ impl DialogueProvider for ClaudeProvider {
                         "sessionId": new_id,
                     })
                 }
-                CanonicalRole::Assistant => {
-                    let mut content_arr = vec![json!({
-                        "type": "text",
-                        "text": msg.content,
-                    })];
+                CanonicalRole::Assistant | CanonicalRole::ToolCall => {
+                    let mut content_arr = Vec::new();
+                    if !msg.content.is_empty() {
+                        content_arr.push(json!({"type": "text", "text": msg.content}));
+                    }
 
                     for tc in &msg.tool_calls {
                         content_arr.push(json!({
                             "type": "tool_use",
+                            "id": format!("toolu_{}", crate::canonical::uuid_v4_simple()),
                             "name": tc.name,
-                            "input": tc.args,
+                            "input": claude_tool_input(&tc.args)?,
                         }));
                     }
 
@@ -328,6 +354,20 @@ impl DialogueProvider for ClaudeProvider {
 
         Ok(new_id)
     }
+}
+
+fn claude_tool_input(args: &str) -> Result<Value> {
+    let input = if args.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(args)?
+    };
+    if !input.is_object() {
+        return Err(AppError::General(
+            "Claude tool arguments must be a JSON object".to_string(),
+        ));
+    }
+    Ok(input)
 }
 
 fn extract_claude_text(val: &Value) -> Option<String> {
@@ -377,4 +417,139 @@ fn extract_claude_tool_calls(val: &Value) -> Vec<CanonicalToolCall> {
         }
     }
     calls
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ai-dialogs-provider-test-{}",
+                crate::canonical::uuid_v4_simple()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn tool_only_turns_and_source_dates_survive_loading() {
+        let dir = TestDir::new();
+        let provider = ClaudeProvider::with_base_dir(dir.0.clone());
+        fs::create_dir_all(provider.projects_dir()).unwrap();
+        let record = json!({
+            "type": "assistant",
+            "uuid": "tool-message",
+            "timestamp": "2021-01-02T03:04:05+02:00",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tool-1", "name": "read_file", "input": {"path": "file.rs"}}]
+            }
+        });
+        fs::write(
+            provider.projects_dir().join("tool-only.jsonl"),
+            format!("{}\n", record),
+        )
+        .unwrap();
+        let loaded = provider.load_canonical("tool-only").unwrap();
+        assert_eq!(
+            loaded.created_at.as_deref(),
+            Some("2021-01-02T03:04:05+02:00")
+        );
+        assert_eq!(loaded.updated_at, loaded.created_at);
+        assert_eq!(loaded.messages.len(), 1);
+        assert!(loaded.messages[0].content.is_empty());
+        assert_eq!(loaded.messages[0].tool_calls[0].name, "read_file");
+        assert_eq!(
+            serde_json::from_str::<Value>(&loaded.messages[0].tool_calls[0].args).unwrap(),
+            json!({"path": "file.rs"})
+        );
+    }
+
+    #[test]
+    fn tool_inputs_remain_objects_across_repeated_roundtrips() {
+        let dir = TestDir::new();
+        let provider = ClaudeProvider::with_base_dir(dir.0.clone());
+        let mut dialogue = CanonicalDialogue::new("source", "Tools", AgentKind::Claude);
+        dialogue.created_at = Some("2020-01-02T03:04:05Z".to_string());
+        dialogue.updated_at = Some("2020-01-02T04:04:05Z".to_string());
+        let mut message = CanonicalMessage::new(CanonicalRole::Assistant, "");
+        message.timestamp = dialogue.updated_at.clone();
+        message.tool_calls.push(CanonicalToolCall {
+            name: "run".to_string(),
+            args: r#"{"command":"echo \"hello\"","options":{"quiet":true}}"#.to_string(),
+            result: None,
+        });
+        dialogue.messages.push(message);
+        for _ in 0..2 {
+            let id = provider.save_canonical(&dialogue).unwrap();
+            let path = provider
+                .list_dialogues()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == id)
+                .unwrap()
+                .transcript_path
+                .unwrap();
+            let records: Vec<Value> = fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(records[1]["message"]["content"][0]["input"].is_object());
+            assert!(records[1]["message"]["content"][0]["id"].is_string());
+            let loaded = provider.load_canonical(&id).unwrap();
+            assert_eq!(loaded.created_at, dialogue.created_at);
+            assert_eq!(loaded.updated_at, dialogue.updated_at);
+            assert_eq!(
+                loaded.messages[0].tool_calls[0].args,
+                dialogue.messages[0].tool_calls[0].args
+            );
+            dialogue = loaded;
+        }
+    }
+
+    #[test]
+    fn invalid_tool_inputs_do_not_create_partial_sessions() {
+        let dir = TestDir::new();
+        let provider = ClaudeProvider::with_base_dir(dir.0.clone());
+        let mut dialogue = CanonicalDialogue::new("source", "Tools", AgentKind::Claude);
+        let mut message = CanonicalMessage::new(CanonicalRole::Assistant, "");
+        message.tool_calls.push(CanonicalToolCall {
+            name: "run".to_string(),
+            args: "not-json".to_string(),
+            result: None,
+        });
+        dialogue.messages.push(message);
+        assert!(provider.save_canonical(&dialogue).is_err());
+        assert!(provider.collect_jsonl_files().is_empty());
+    }
+
+    #[test]
+    fn listing_retains_later_prompts_and_full_first_prompt() {
+        let dir = TestDir::new();
+        let provider = ClaudeProvider::with_base_dir(dir.0.clone());
+        let mut dialogue = CanonicalDialogue::new("source", "Search", AgentKind::Claude);
+        dialogue.messages = vec![
+            CanonicalMessage::new(
+                CanonicalRole::User,
+                format!("{} hidden keyword", "a".repeat(100)),
+            ),
+            CanonicalMessage::new(CanonicalRole::User, "later prompt"),
+        ];
+        provider.save_canonical(&dialogue).unwrap();
+        let items = provider.list_dialogues().unwrap();
+        assert!(items[0].user_messages[0].contains("hidden keyword"));
+        assert_eq!(items[0].user_messages[1], "later prompt");
+    }
 }

@@ -1,4 +1,4 @@
-use crate::canonical::{AgentKind, CanonicalDialogue};
+use crate::canonical::{AgentKind, CanonicalDialogue, CanonicalRole};
 use crate::error::{AppError, Result};
 use crate::models::DialogueItem;
 use crate::providers::DialogueProvider;
@@ -24,11 +24,15 @@ impl UniversalProvider {
         Self { base_dir }
     }
 
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
+
     pub fn export_to_file(dialogue: &CanonicalDialogue, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = File::create(path)?;
+        let file = File::create_new(path)?;
         serde_json::to_writer_pretty(file, dialogue)?;
         Ok(())
     }
@@ -74,7 +78,13 @@ impl DialogueProvider for UniversalProvider {
                     {
                         let u_count = dialogue.user_messages_count();
                         let a_count = dialogue.assistant_messages_count();
-                        let item = DialogueItem::new_external(
+                        let user_messages = dialogue
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == CanonicalRole::User)
+                            .map(|message| message.content.clone())
+                            .collect();
+                        let mut item = DialogueItem::new_external(
                             stem,
                             AgentKind::Universal,
                             dialogue.title,
@@ -83,7 +93,10 @@ impl DialogueProvider for UniversalProvider {
                             a_count,
                             size,
                             Some(path),
-                        );
+                        )
+                        .with_user_messages(user_messages);
+                        item.total_steps = dialogue.messages.len();
+                        item.is_empty = dialogue.messages.is_empty();
                         items.push(item);
                     }
                 }
@@ -95,37 +108,101 @@ impl DialogueProvider for UniversalProvider {
     }
 
     fn load_canonical(&self, id: &str) -> Result<CanonicalDialogue> {
-        let target_path = self.base_dir.join(format!("{}.json", id));
-        if target_path.exists() {
-            Self::import_from_file(&target_path)
-        } else {
-            let matches = self.list_dialogues()?;
-            let item = matches
-                .into_iter()
-                .find(|it| it.id == id || it.id.starts_with(id))
-                .ok_or_else(|| {
-                    AppError::General(format!("Universal dialogue not found: {}", id))
-                })?;
-            if let Some(ref path) = item.transcript_path {
-                Self::import_from_file(path)
-            } else {
-                Err(AppError::General(format!(
-                    "Path not found for dialogue: {}",
-                    id
-                )))
-            }
-        }
+        let items = self.list_dialogues()?;
+        let item = crate::providers::resolve_dialogue(&items, id, Some(AgentKind::Universal))?
+            .ok_or_else(|| AppError::NotFound(id.to_string()))?;
+        let path = item
+            .transcript_path
+            .as_ref()
+            .ok_or_else(|| AppError::NotFound(id.to_string()))?;
+        Self::import_from_file(path)
     }
 
     fn save_canonical(&self, dialogue: &CanonicalDialogue) -> Result<String> {
         fs::create_dir_all(&self.base_dir)?;
-        let new_id = if dialogue.id.is_empty() {
-            crate::canonical::uuid_v4_simple()
-        } else {
-            dialogue.id.clone()
-        };
+        let new_id = crate::canonical::uuid_v4_simple();
         let file_path = self.base_dir.join(format!("{}.json", new_id));
-        Self::export_to_file(dialogue, &file_path)?;
+        let mut imported = dialogue.clone();
+        imported.id = new_id.clone();
+        if !dialogue.id.is_empty() {
+            imported
+                .metadata
+                .original_id
+                .get_or_insert_with(|| dialogue.id.clone());
+        }
+        let bytes = serde_json::to_vec_pretty(&imported)?;
+        let mut file = File::create_new(file_path)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
         Ok(new_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::CanonicalMessage;
+    use crate::test_support::TestDir;
+
+    #[test]
+    fn imports_never_use_source_ids_as_paths_or_replace_sessions() {
+        let fixture = TestDir::new("universal-import");
+        let provider = UniversalProvider::with_base_dir(fixture.path().join("sessions"));
+        fs::create_dir_all(&provider.base_dir).unwrap();
+        let outside = fixture.path().join("outside.json");
+        let existing = provider.base_dir.join("existing.json");
+        fs::write(&outside, "outside data").unwrap();
+        fs::write(&existing, "existing session").unwrap();
+        for source_id in [
+            "../outside",
+            "existing",
+            outside.with_extension("").to_str().unwrap(),
+            "",
+        ] {
+            let mut dialogue = CanonicalDialogue::new(source_id, "Import", AgentKind::Claude);
+            dialogue
+                .messages
+                .push(CanonicalMessage::new(CanonicalRole::User, "First prompt"));
+            dialogue.messages.push(CanonicalMessage::new(
+                CanonicalRole::User,
+                "Later searchable keyword",
+            ));
+            let first = provider.save_canonical(&dialogue).unwrap();
+            let first_bytes = fs::read(provider.base_dir.join(format!("{first}.json"))).unwrap();
+            let second = provider.save_canonical(&dialogue).unwrap();
+            assert_ne!(first, second);
+            assert!(uuid::Uuid::parse_str(&first).is_ok());
+            assert_eq!(
+                fs::read(provider.base_dir.join(format!("{first}.json"))).unwrap(),
+                first_bytes
+            );
+            let loaded = provider.load_canonical(&first).unwrap();
+            assert_eq!(loaded.id, first);
+            if !source_id.is_empty() {
+                assert_eq!(loaded.metadata.original_id.as_deref(), Some(source_id));
+            }
+            let item = provider
+                .list_dialogues()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == first)
+                .unwrap();
+            assert_eq!(
+                item.user_messages,
+                ["First prompt", "Later searchable keyword"]
+            );
+        }
+        assert_eq!(fs::read_to_string(outside).unwrap(), "outside data");
+        assert_eq!(fs::read_to_string(existing).unwrap(), "existing session");
+        assert!(provider.load_canonical("../outside").is_err());
+    }
+
+    #[test]
+    fn export_refuses_to_truncate_existing_output() {
+        let fixture = TestDir::new("universal-export");
+        let output = fixture.path().join("export.json");
+        fs::write(&output, "previous export").unwrap();
+        let dialogue = CanonicalDialogue::new("id", "Title", AgentKind::Universal);
+        assert!(UniversalProvider::export_to_file(&dialogue, &output).is_err());
+        assert_eq!(fs::read_to_string(output).unwrap(), "previous export");
     }
 }
