@@ -52,11 +52,66 @@ It natively connects, discovers, searches, renders, and **transfers dialogues ac
 
 ## 📦 Installation & Building
 
-### Prerequisites
-- Current stable Rust toolchain (Edition 2024)
-- `cargo`
+### Pre-built Binary (Recommended for macOS)
+
+Download the latest release archive for macOS from [GitHub Releases](https://github.com/a269ch/ai-dialogs/releases):
+
+- **Universal macOS (Apple Silicon & Intel)**: `ai-dialogs-v0.2.0-universal-apple-darwin.tar.gz`
+- **Apple Silicon (M1/M2/M3/M4)**: `ai-dialogs-v0.2.0-aarch64-apple-darwin.tar.gz`
+- **Intel Mac**: `ai-dialogs-v0.2.0-x86_64-apple-darwin.tar.gz`
+
+#### Quick Install via Terminal
+
+1. **Download and unpack** the archive (e.g. Universal binary):
+```bash
+# Download latest Universal archive
+curl -LO https://github.com/a269ch/ai-dialogs/releases/latest/download/ai-dialogs-v0.2.0-universal-apple-darwin.tar.gz
+
+# Extract binary
+tar -xzf ai-dialogs-v0.2.0-universal-apple-darwin.tar.gz
+```
+
+2. **Make executable and install** into your PATH:
+```bash
+# User installation (no sudo required)
+mkdir -p ~/.local/bin
+mv ai-dialogs ~/.local/bin/
+chmod +x ~/.local/bin/ai-dialogs
+
+# Or system-wide installation
+sudo mv ai-dialogs /usr/local/bin/
+sudo chmod +x /usr/local/bin/ai-dialogs
+```
+
+3. **Ensure `~/.local/bin` is in your PATH** (if installing to user directory):
+```bash
+# For Zsh (macOS default):
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+
+# For Bash:
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+> [!NOTE]
+> **macOS Gatekeeper Quarantine**: If macOS blocks running the downloaded binary because it was downloaded from a browser or curl, remove the quarantine attribute:
+> ```bash
+> xattr -d com.apple.quarantine ~/.local/bin/ai-dialogs
+> # or if installed in /usr/local/bin:
+> sudo xattr -d com.apple.quarantine /usr/local/bin/ai-dialogs
+> ```
+
+4. **Verify installation**:
+```bash
+ai-dialogs --help
+```
 
 ### Build from Source
+
+#### Prerequisites
+- Current stable Rust toolchain (Edition 2024)
+- `cargo`
 
 ```bash
 git clone git@github.com:a269ch/ai-dialogs.git
@@ -66,7 +121,7 @@ cargo build --release
 
 The compiled binary will be placed at `target/release/ai-dialogs`.
 
-### Install to System
+#### Install to System
 
 ```bash
 # Install via cargo
@@ -120,8 +175,14 @@ ai-dialogs --list
 ai-dialogs --list --provider claude
 ai-dialogs --list --provider agy
 
+# Resume / continue an interactive session in terminal (auto-detects agent)
+ai-dialogs 1ffad7c1
+ai-dialogs open 1ffad7c1
+ai-dialogs --resume 1ffad7c1
+
 # View any dialogue with syntax highlighting (auto-detects agent)
 ai-dialogs --view 1ffad7c1
+ai-dialogs view 1ffad7c1
 
 # Transfer a Claude Code session to Google Antigravity
 ai-dialogs --transfer 1ffad7c1 --from claude --to agy
@@ -165,6 +226,7 @@ ai-dialogs
 - `PgUp`, `PgDn` — Fast page scrolling.
 - `Home` / `g`, `End` / `G` — Jump to start / end of list.
 - `Enter` / `v` — Open and read selected dialogue.
+- `o` / `O` — Resume / continue dialogue directly in terminal CLI agent (`agy`, `claude`, `codex`, `grok`).
 - `p` / `P` — Cycle active agent filter (`ALL` -> `AGY` -> `CLAUDE` -> `CODEX` -> `GROK` -> `UNIV`).
 - `m` / `M` — Open transfer/migration modal to send dialogue to another agent.
 - `Space` — Toggle selection mark `[✓]`.
@@ -174,18 +236,19 @@ ai-dialogs
 - `d` / `x` — Move to trash / permanently delete (in trash view).
 - `b` / `B` — Batch delete all marked sessions.
 - `c` / `C` — Empty trash (in trash view) / clean empty sessions (in active view).
-- `/` or `s` — Search by ID or dialogue topic / prompts.
+- `/` — Search by ID or dialogue topic / prompts.
 - `Esc` — Reset search filter or quit if search is empty.
 - `Tab` / `f` — Cycle filter mode (`ALL` -> `USER` -> `SUBAGENT` -> `EMPTY` -> `MARKED` -> `TRASH`).
-- `o` / `O` — Cycle sort order (`NEWEST` -> `OLDEST` -> `SIZE` -> `MSGS`).
+- `s` / `S` — Cycle sort order (`NEWEST` -> `OLDEST` -> `SIZE` -> `MSGS`).
 - `e` / `E` — Export selected dialogue to Markdown.
-- `R` / `F5` — Refresh all dialogues from disk.
+- `R` / `F5` — Reload dialogues from disk.
 - `h` / `?` — Display help window.
 - `q` / `Q` — Quit application.
 
 ### Dialogue Viewer:
 - `↑` / `↓` / `←` / `→`, `h`/`j`/`k`/`l` — Free scrolling in all directions.
 - `0` — Reset horizontal scroll to beginning of lines.
+- `o` / `O` — Resume / continue dialogue directly in terminal CLI agent.
 - `u` — Jump to next user prompt.
 - `m` / `a` — Jump to next assistant response.
 - `/` — Search text inside dialogue.

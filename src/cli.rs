@@ -42,6 +42,21 @@ pub struct Cli {
     pub view: Option<String>,
 
     #[arg(
+        short = 'o',
+        long = "open",
+        value_name = "ID",
+        help = "Open and resume dialogue in terminal CLI"
+    )]
+    pub open: Option<String>,
+
+    #[arg(
+        long = "resume",
+        value_name = "ID",
+        help = "Resume dialogue in terminal CLI (alias for --open)"
+    )]
+    pub resume: Option<String>,
+
+    #[arg(
         short = 'd',
         long = "delete",
         value_name = "ID",
@@ -128,6 +143,18 @@ pub struct Cli {
         help = "Import dialogue from Universal JSON file"
     )]
     pub import_json: Option<String>,
+
+    #[arg(
+        help = "Session ID or command ('open <ID>', 'resume <ID>', or direct ID)",
+        value_name = "COMMAND_OR_ID"
+    )]
+    pub session_arg: Option<String>,
+
+    #[arg(
+        help = "Target session ID if command was specified",
+        value_name = "TARGET_ID"
+    )]
+    pub session_target: Option<String>,
 }
 
 impl Cli {
@@ -135,6 +162,9 @@ impl Cli {
         self.list
             || self.trash
             || self.view.is_some()
+            || self.open.is_some()
+            || self.resume.is_some()
+            || self.session_arg.is_some()
             || self.delete.is_some()
             || self.restore.is_some()
             || self.export.is_some()
@@ -163,6 +193,44 @@ fn prompt_user(prompt: &str) -> bool {
 pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
     let registry = ProviderRegistry::new();
     let provider_filter = cli_result(parse_provider_filter(cli.provider.as_deref()));
+
+    let positional_view = if let Some(ref arg) = cli.session_arg {
+        if arg == "view" {
+            if cli.session_target.is_none() {
+                eprintln!("Error: Specify dialogue ID to view.");
+                process::exit(1);
+            }
+            cli.session_target.as_deref()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let view_id = cli.view.as_deref().or(positional_view);
+
+    let positional_resume = if let Some(ref arg) = cli.session_arg {
+        if arg == "open" || arg == "resume" {
+            if cli.session_target.is_none() {
+                eprintln!("Error: Specify dialogue ID to open/resume.");
+                process::exit(1);
+            }
+            cli.session_target.as_deref()
+        } else if arg != "view" {
+            Some(arg.as_str())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let resume_id = cli
+        .open
+        .as_deref()
+        .or(cli.resume.as_deref())
+        .or(positional_resume);
 
     if cli.providers {
         println!();
@@ -294,7 +362,7 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
             }))),
             None => provider_filter,
         };
-        let export_id = match cli.view.as_deref().or(cli.export.as_deref()) {
+        let export_id = match view_id.or(cli.export.as_deref()) {
             Some(id) => id,
             None => {
                 eprintln!("Error: Specify dialogue ID to export via -v <ID> or -e <ID>");
@@ -396,7 +464,29 @@ pub fn handle_cli(cli: &Cli, store: &mut DialogueStore) {
         return;
     }
 
-    if let Some(ref view_id) = cli.view {
+    if let Some(id) = resume_id {
+        let item = cli_result(resolve_cli_item(&registry, store, id, provider_filter));
+        if item.is_in_trash {
+            eprintln!("Dialogue '{}' is in trash. Restore it before resuming.", id);
+            process::exit(1);
+        }
+        println!(
+            "Resuming {} session '{}'...",
+            item.agent.display_name(),
+            item.id
+        );
+        match crate::launcher::run_interactive(&item) {
+            Ok(status) => {
+                process::exit(status.code().unwrap_or(0));
+            }
+            Err(e) => {
+                eprintln!("Error resuming dialogue: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if let Some(view_id) = view_id {
         let item = cli_result(resolve_cli_item(&registry, store, view_id, provider_filter));
         cli_view_item(store, &item, item.is_in_trash);
         return;

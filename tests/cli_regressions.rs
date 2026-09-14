@@ -101,6 +101,12 @@ fn cli_inventory_and_view_cover_all_providers() {
     }
     let view = fixture.success(&["--view", "12345678", "--provider", "codex"]);
     assert!(view.contains("Codex prompt") && view.contains("Codex answer"));
+    let positional_view = fixture.success(&["view", "12345678", "--provider", "codex"]);
+    assert_eq!(view, positional_view);
+    let missing_open = fixture.run(&["open"]);
+    assert!(!missing_open.status.success());
+    let err_str = String::from_utf8_lossy(&missing_open.stderr);
+    assert!(err_str.contains("Specify dialogue ID"));
     let universal = fixture.success(&["--view", "shared-session", "--provider", "universal"]);
     assert!(universal.contains("Universal prompt"));
     assert!(!universal.contains("Claude prompt") && !universal.contains("Antigravity prompt"));

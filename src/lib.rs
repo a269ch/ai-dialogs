@@ -2,6 +2,7 @@ pub mod canonical;
 pub mod cleaner;
 pub mod cli;
 pub mod error;
+pub mod launcher;
 pub mod markdown;
 pub mod models;
 pub mod providers;

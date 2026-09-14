@@ -115,7 +115,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("] (O)", Style::default().fg(Color::DarkGray)),
+        Span::styled("] (S)", Style::default().fg(Color::DarkGray)),
     ];
 
     if !app.search_query.is_empty() {
@@ -132,23 +132,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         filter_line_spans.push(Span::styled(
             "\" (Esc to reset)",
             Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    let left_w: usize = filter_line_spans
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
-    let quit_hint = " [?] Help | [Q] Quit ";
-    let quit_w = UnicodeWidthStr::width(quit_hint);
-    if width > left_w + quit_w {
-        let pad = width - (left_w + quit_w);
-        filter_line_spans.push(Span::styled(" ".repeat(pad), Style::default()));
-        filter_line_spans.push(Span::styled(
-            quit_hint,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -347,18 +330,18 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let status_left = format!(" {} ", app.status_msg);
     let keys = if app.is_trash_view() {
         if width >= 105 {
-            " [Enter] Read | [U] Restore | [D] Delete permanently | [C] Empty trash | [Tab] Active | [Q] Quit "
+            " [Enter] Read | [U] Restore | [D] Delete permanently | [C] Empty trash | [Tab] Active | [?] Help | [Q] Quit "
         } else if width >= 80 {
             " [Enter] Read | [U] Restore | [D] Delete | [Tab] Active | [?] Help | [Q] Quit "
         } else {
-            " [Enter] Read | [U] Restore | [D] Delete | [Q] Quit "
+            " [Enter] Read | [U] Restore | [D] Delete | [?] Help | [Q] Quit "
         }
-    } else if width >= 115 {
-        " [Enter] Read | [Space] Mark | [M] Migrate | [P] Agent | [D] Trash | [/] Search | [E] Export | [Q] Quit "
-    } else if width >= 85 {
-        " [Enter] Read | [M] Migrate | [P] Agent | [D] Trash | [/] Search | [?] Help | [Q] Quit "
+    } else if width >= 120 {
+        " [Enter] Read | [O] Resume | [Space] Mark | [M] Migrate | [P] Agent | [S] Sort | [D] Trash | [/] Search | [?] Help | [Q] Quit "
+    } else if width >= 95 {
+        " [Enter] Read | [O] Resume | [M] Migrate | [P] Agent | [D] Trash | [/] Search | [?] Help | [Q] Quit "
     } else {
-        " [Enter] Read | [M] Migrate | [P] Agent | [Q] Quit "
+        " [Enter] Read | [O] Resume | [M] Migrate | [?] Help | [Q] Quit "
     };
 
     let left_w = UnicodeWidthStr::width(status_left.as_str());
@@ -500,7 +483,7 @@ fn draw_viewer(f: &mut Frame, app: &mut App) {
 
         let topic_short: String = viewer.item.topic.chars().take(45).collect();
         let foot_text = format!(" Dialogue: {} | Log: {} ", topic_short, log_name);
-        let foot_right = " [Q / Esc] Back ";
+        let foot_right = " [O] Resume | [Q / Esc] Back ";
         let left_w = UnicodeWidthStr::width(foot_text.as_str());
         let right_w = UnicodeWidthStr::width(foot_right);
         let pad = (size.width as usize).saturating_sub(left_w + right_w);
@@ -619,7 +602,7 @@ fn draw_confirm_popup(f: &mut Frame, message: &str, is_destructive: bool) {
 }
 
 fn draw_help_popup(f: &mut Frame) {
-    let area = centered_rect_fixed(78, 25, f.area());
+    let area = centered_rect_fixed(78, 27, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -680,7 +663,7 @@ fn draw_help_popup(f: &mut Frame) {
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
-            "  / or s           : Search by ID or keyword",
+            "  /                : Search by ID or keyword",
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
@@ -700,7 +683,11 @@ fn draw_help_popup(f: &mut Frame) {
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
-            "  o / O            : Cycle sort order (Newest/Oldest/Size/Messages)",
+            "  o / O            : Open / resume dialogue in terminal CLI agent",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "  s / S            : Cycle sort order (Newest/Oldest/Size/Messages)",
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
@@ -709,6 +696,10 @@ fn draw_help_popup(f: &mut Frame) {
         )),
         Line::from(Span::styled(
             "  R / F5           : Reload dialogues from disk",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "  ?                : Show this help popup",
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(

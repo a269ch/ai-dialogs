@@ -381,6 +381,7 @@ pub struct App {
     pub show_help: bool,
     pub confirm: Option<ConfirmDialog>,
     pub viewer: Option<ViewerState>,
+    pub resume_target: Option<DialogueItem>,
 }
 
 impl Default for App {
@@ -405,11 +406,12 @@ impl App {
             search_query: String::new(),
             is_searching: false,
             search_input: String::new(),
-            status_msg: "Ready. Press [H] for help.".to_string(),
+            status_msg: "Ready".to_string(),
             running: true,
             show_help: false,
             confirm: None,
             viewer: None,
+            resume_target: None,
         };
         app.refresh_all();
         app
@@ -1064,6 +1066,7 @@ pub(super) fn test_app(base: &std::path::Path) -> App {
         show_help: false,
         confirm: None,
         viewer: None,
+        resume_target: None,
     }
 }
 

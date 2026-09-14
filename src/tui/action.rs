@@ -37,6 +37,7 @@ pub enum Action {
     ToggleMark,
     ToggleMarkAll,
     OpenViewer,
+    ResumeSession,
     Restore,
     Delete,
     BatchDelete,
@@ -110,6 +111,7 @@ pub fn map_viewer_key(key: KeyEvent, is_trash: bool) -> Option<Action> {
         KeyCode::Char('N') => Some(Action::ViewerFindPrev),
         KeyCode::Char('e' | 'E') => Some(Action::Export),
         KeyCode::Char('d' | 'D' | 'x' | 'X') => Some(Action::ViewerDelete),
+        KeyCode::Char('o' | 'O') => Some(Action::ResumeSession),
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(Action::CloseViewer),
         _ => None,
     }
@@ -140,11 +142,12 @@ pub fn map_main_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('d' | 'D' | 'x' | 'X') => Some(Action::Delete),
         KeyCode::Char('b' | 'B') => Some(Action::BatchDelete),
         KeyCode::Char('c' | 'C') => Some(Action::CleanOrEmpty),
-        KeyCode::Char('/' | 's' | 'S') => Some(Action::SearchStart),
+        KeyCode::Char('/') => Some(Action::SearchStart),
+        KeyCode::Char('s' | 'S') => Some(Action::CycleSort),
         KeyCode::Esc => Some(Action::ClearSearch),
         KeyCode::Char('t' | 'T') => Some(Action::ToggleTrash),
         KeyCode::Tab | KeyCode::Char('f' | 'F') => Some(Action::CycleFilter),
-        KeyCode::Char('o' | 'O') => Some(Action::CycleSort),
+        KeyCode::Char('o' | 'O') => Some(Action::ResumeSession),
         KeyCode::Char('p' | 'P') => Some(Action::CycleProvider),
         KeyCode::Char('m' | 'M') => Some(Action::TransferStart),
         KeyCode::Char('e' | 'E') => Some(Action::Export),
@@ -248,6 +251,26 @@ mod tests {
         assert_eq!(
             map_main_key(press(KeyCode::Char('M'))),
             Some(Action::TransferStart)
+        );
+        assert_eq!(
+            map_main_key(press(KeyCode::Char('o'))),
+            Some(Action::ResumeSession)
+        );
+        assert_eq!(
+            map_main_key(press(KeyCode::Char('O'))),
+            Some(Action::ResumeSession)
+        );
+        assert_eq!(
+            map_main_key(press(KeyCode::Char('s'))),
+            Some(Action::CycleSort)
+        );
+        assert_eq!(
+            map_main_key(press(KeyCode::Char('S'))),
+            Some(Action::CycleSort)
+        );
+        assert_eq!(
+            map_viewer_key(press(KeyCode::Char('o')), false),
+            Some(Action::ResumeSession)
         );
     }
 }

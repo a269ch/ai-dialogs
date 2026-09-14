@@ -42,6 +42,25 @@ pub fn run_tui() -> Result<(), io::Error> {
     let mut app = App::new();
 
     while app.running {
+        if let Some(item) = app.resume_target.take() {
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+
+            match crate::launcher::run_interactive(&item) {
+                Ok(status) => {
+                    app.status_msg = format!("Session finished ({})", status);
+                }
+                Err(e) => {
+                    app.status_msg = format!("Resume failed: {}", e);
+                }
+            }
+
+            let _ = enable_raw_mode();
+            let _ = execute!(stdout(), EnterAlternateScreen);
+            terminal.clear()?;
+            app.refresh_all();
+        }
+
         terminal.draw(|f| draw_app(f, &mut app))?;
 
         if event::poll(Duration::from_millis(100))?
@@ -199,6 +218,15 @@ fn handle_key_event(app: &mut App, key: KeyEvent, term_width: usize) {
                         });
                     }
                 }
+                Action::ResumeSession => {
+                    let item = viewer.item.clone();
+                    if item.is_in_trash {
+                        app.status_msg =
+                            "Cannot resume dialogue in trash. Restore it first.".to_string();
+                    } else {
+                        app.resume_target = Some(item);
+                    }
+                }
                 Action::CloseViewer => app.close_viewer(),
                 _ => {}
             }
@@ -268,6 +296,18 @@ fn handle_key_event(app: &mut App, key: KeyEvent, term_width: usize) {
                 if !items.is_empty() && app.selected_idx < items.len() {
                     let item = items[app.selected_idx].clone();
                     app.open_viewer(item, term_width);
+                }
+            }
+            Action::ResumeSession => {
+                let items = app.filtered_items();
+                if !items.is_empty() && app.selected_idx < items.len() {
+                    let item = items[app.selected_idx].clone();
+                    if item.is_in_trash {
+                        app.status_msg =
+                            "Cannot resume dialogue in trash. Restore it first.".to_string();
+                    } else {
+                        app.resume_target = Some(item);
+                    }
                 }
             }
             Action::Restore => {
