@@ -989,7 +989,7 @@ pub fn case_insensitive_match_ranges(text: &str, query: &str) -> Vec<std::ops::R
     for (start, matched) in folded.match_indices(&query) {
         let range = source_ranges[start].start..source_ranges[start + matched.len() - 1].end;
         if let Some(previous) = ranges.last_mut()
-            && range.start < previous.end
+            && range.start <= previous.end
         {
             previous.end = previous.end.max(range.end);
         } else {
@@ -1315,5 +1315,24 @@ mod tests {
         assert_eq!(app.provider_name(), "UNIV");
         app.cycle_provider();
         assert_eq!(app.provider_name(), "ALL");
+    }
+}
+
+#[cfg(test)]
+mod tests_search_fuzzy {
+    use super::*;
+
+    #[test]
+    fn test_case_insensitive_match_ranges_fuzz() {
+        assert_eq!(case_insensitive_match_ranges("Hello", "ll"), vec![2..4]);
+        assert_eq!(case_insensitive_match_ranges("İ", "i"), vec![0..2]);
+        assert_eq!(case_insensitive_match_ranges("I", "i"), vec![0..1]);
+        assert_eq!(case_insensitive_match_ranges("a", "a"), vec![0..1]);
+        assert_eq!(
+            case_insensitive_match_ranges("ẞ", "ss"),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        // Verify contiguous matches merge correctly
+        assert_eq!(case_insensitive_match_ranges("llll", "ll"), vec![0..4]);
     }
 }
